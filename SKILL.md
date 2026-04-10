@@ -1,6 +1,6 @@
 ---
 name: claude-code-task
-description: "Launch Claude Code async in background with automatic delivery to Telegram/WhatsApp. Use for coding, refactoring, codebase research, file generation, and complex multi-step automations. NOT for quick one-off questions or real-time interactive tasks. Includes strict thread-safe routing + E2E operator validation workflow."
+description: "Launch Claude Code async in background with automatic delivery to Telegram/WhatsApp. Use for coding, refactoring, codebase research, deep research, comprehensive investigations, multi-source reports, file generation, and complex multi-step automations. NOT for quick one-off questions or real-time interactive tasks. Includes strict thread-safe routing + E2E operator validation workflow."
 ---
 
 # Claude Code Task (Async)
@@ -11,7 +11,7 @@ Run Claude Code in background — zero OpenClaw tokens while it works. Results d
 
 Claude Code is NOT just a coding tool. It's a full-powered AI agent with web search, file access, and deep reasoning. Use it for ANY complex task:
 
-- **Research** — web search, synthesis, competitive analysis, user experience reports
+- **Research** — web search, synthesis, competitive analysis, user experience reports, deep research, evidence gathering, tradeoff studies, sanctions/KYC/AML investigations
 - **Coding** — create tools, scripts, APIs, refactor codebases
 - **Analysis** — read and analyze files, data, logs, source code
 - **Content** — write docs, presentations, reports, summaries
@@ -86,7 +86,7 @@ Before launching Claude Code, post a short plan in chat:
 - how you plan to solve the task,
 - what result you expect from this run,
 - any clarifying questions/assumptions,
-- whether you expect one iteration or a staged multi-iteration approach.
+- whether you expect a single-pass result or a staged multi-step approach.
 
 If staged: explicitly say this run is "phase 1" and what signal will decide phase 2.
 
@@ -114,7 +114,7 @@ Resolve the **current runtime session key** first (source of truth), then launch
 
 This is intentional: **abort fast > silent misroute**.
 
-⚠️ **ALWAYS launch via nohup** — exec timeout (2 min) will kill the process!
+⚠️ For background `claude-code-task` launches, **do not set `exec.timeout`**; use only `run-task.py --timeout`, otherwise OpenClaw may SIGTERM the whole process group early.
 
 ⚠️ **NEVER put the task text directly in the shell command** — quotes, special characters, and newlines WILL break argument parsing. Always save the prompt to a file first, then use `$(cat file)`.
 
@@ -182,8 +182,8 @@ All 5 notification types route to the DM thread when `--session` key contains `:
 
 - `--notify-channel` — optional channel hint (`telegram`/`whatsapp`); target is always auto-resolved from session metadata
 - `--timeout` — max runtime in seconds (default: 7200 = 2 hours)
-- `--completion-mode` — optional legacy hint (`single` default, `iterate` if explicitly needed)
-- `--max-iterations` — optional budget hint when using iterate mode
+- built-in smart stall observer (shadow mode): sends "would terminate" warnings on likely hangs
+- built-in post-result tail-hang detector (short grace after result event)
 - `--trace-live` — emit live technical trace markers into the same chat/thread (debug mode)
 - Always redirect stdout/stderr to a log file
 
@@ -237,17 +237,13 @@ def detect_channel(session_key):
 3. **Agent receives** completion payload via sessions_send → processes it → sends summary via `message(send)` to WhatsApp group
 4. Human sees both: raw result + agent's analysis/next steps
 
-### Iterative continuation mode (wake behavior)
-`--completion-mode` is optional (default `single`) and acts as a hint:
-- `single` = one run → continuation summary → stop
-- `iterate` = continuation summary + exactly one next iteration when gaps remain
+### Wake continuation behavior
+Wake payload frames continuation as the **same ongoing assistant conversation** (same agent identity, same session, same history) after Claude Code replies to the previous launch.
 
-Wake payload now frames continuation as the **same ongoing assistant conversation** (same agent identity, same session, same history) after Claude Code replies to the previous launch.
-
-In `iterate` mode the continuation flow is:
+Continuation flow:
 - react briefly to Claude result
 - evaluate goal completion (gap analysis)
-- if gaps remain: explain next fix and launch exactly one follow-up iteration
+- if gaps remain: explain next fix and, if needed, launch one follow-up run
 - if complete: report final outcome and stop
 
 ### Deterministic wake guard (anti-duplicate)
@@ -283,9 +279,11 @@ In `iterate` mode the continuation flow is:
 
 ## Reliability Features
 
-### Timeout (default 2 hours)
-- `--timeout 7200` → after 7200s: SIGTERM → wait 10s → SIGKILL
-- Timeout notification sent to channel with tool call count and last activity
+### Timeout / stall protection
+- `--timeout 7200` → hard max runtime (SIGTERM → wait 10s → SIGKILL)
+- built-in smart stall observer (shadow mode): warns when run looks kill-worthy but does not terminate
+- built-in post-result tail-hang detector: warns when process stays alive after result event grace
+- Timeout/stall notification sent to channel with tool call count and last activity
 - Partial output saved to file
 
 ### Crash safety
@@ -586,6 +584,8 @@ When in doubt: skip `--resume` and start fresh.
 ### How to Resume
 
 When a task completes, the session ID is automatically captured and saved to the registry (`~/.openclaw/claude_sessions.json`).
+
+For resumed runs, keep the new prompt **short**. Prior Claude session history is already available through `--resume`; re-sending a long orchestration/continuity prompt can trigger `Prompt is too long` before useful work starts.
 
 To resume a session, use the `--resume` flag:
 
