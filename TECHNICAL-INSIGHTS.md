@@ -1,5 +1,23 @@
 # TECHNICAL INSIGHTS — claude-code-task
 
+## 0) 2026-04-14 runtime compatibility lesson
+- `run-task.py` must not depend on ambient third-party Python packages for basic transport.
+- Real failure observed after runtime/OpenClaw update:
+  - wrapper started under Python 3.14,
+  - `requests` was no longer installed in that interpreter,
+  - process died on import before routing validation or Claude launch.
+- This is the wrong failure boundary for an orchestration script.
+- Better pattern:
+  - use stdlib transport (`urllib.request`) for essential HTTP paths,
+  - reserve third-party dependencies for optional features only.
+- Practical operator symptom:
+  - `--validate-only` fails instantly with `ModuleNotFoundError: No module named 'requests'`,
+  - nothing is wrong with routing itself,
+  - the wrapper never reaches the routing code.
+- Verification after fix:
+  - `--validate-only` passes again,
+  - full detached E2E launch reaches startup marker and continues normally.
+
 ## 1) What caused "extra" wake/agent replies
 - Root cause was event overlap + manual mid-cycle interventions.
 - With `--deliver`, every wake turn becomes visible, so delayed/stale wakes are now observable.

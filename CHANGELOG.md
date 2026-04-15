@@ -1,5 +1,46 @@
 # CHANGELOG — claude-code-task
 
+## 2026-04-15 (unified local progress notify contract)
+
+### Changed
+- `run-task.py` now generates the same local `cc-notify` interface for both Telegram and WhatsApp:
+  - `python3 /tmp/cc-notify-<pid>.py "message"`
+- Channel/backend selection now happens inside the generated script:
+  - Telegram keeps the existing thread-safe direct Bot API path
+  - WhatsApp now uses the same local-script contract, backed by gateway `message.send`
+
+### Why it matters
+- Claude Code now sees one consistent mid-task progress interface across channels.
+- This removes the old split where Telegram used an injected local script but WhatsApp depended on separate prompt/tooling conventions (`openclaw_notify.py --bg`).
+- Result: simpler prompts, less docs/runtime drift, easier testing.
+
+### Validation
+- WhatsApp helper-path E2E confirmed that mid-task progress delivery still works.
+- Unified WhatsApp regression confirmed:
+  - start notify delivered
+  - second notify after sleep delivered
+  - completion delivered
+  - gateway returned distinct `messageId` / `runId` values with `ok:true`
+
+## 2026-04-14 (OpenClaw runtime compatibility fix)
+
+### Fixed
+- Restored `run-task.py` startup in environments where Python no longer has the third-party `requests` package preinstalled.
+- Replaced the wrapper's HTTP dependency on `requests` with a stdlib-based transport (`urllib.request`) for:
+  - gateway `/tools/invoke` calls,
+  - direct Telegram Bot API sends,
+  - direct Telegram message edits.
+- Unblocked the canonical E2E flow again: `--validate-only` routing precheck now runs successfully instead of failing during module import.
+
+### Technical impact
+- Failure mode before fix: `ModuleNotFoundError: No module named 'requests'` at process startup, before routing validation, launch proof, or Claude execution.
+- This surfaced right after an OpenClaw/runtime update that left the skill running under Python 3.14 without `requests` available.
+- Result: the orchestration wrapper was more fragile than it needed to be for a system script.
+
+### Documentation
+- Added a compatibility note to `SKILL.md` warning that `run-task.py` must not rely on ambient third-party Python packages for core transport.
+- Added a technical insight entry documenting the root cause and the preferred stdlib transport pattern for wrapper reliability.
+
 ## 2026-04-01 (legacy cleanup + completion-tail fix)
 
 ### Changed

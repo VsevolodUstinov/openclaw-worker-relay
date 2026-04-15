@@ -49,7 +49,7 @@ Use the canonical protocol: **[references/testing-protocol.md](references/testin
 `run-task.py` is asynchronous orchestration.
 
 After a successful `nohup` launch, the correct behavior is:
-1. Send a short launch acknowledgment (PID/log/session), then
+1. Send a short launch acknowledgment (PID/log/session + a brief human-written summary of what you asked Claude to do), then
 2. **Stop this turn immediately**.
 3. Continue only when wake/completion event arrives in the same session.
 
@@ -79,6 +79,11 @@ If launch fails with `❌ Invalid routing`:
 - only then send launch acknowledgment.
 
 Do not send "Claude Code ушёл в работу" before this gate is satisfied.
+
+Important: in your own launch acknowledgment, do **not** restate the full raw prompt.
+- Give only a short human summary of the task.
+- The run-task launch notification already includes the full prompt/body when needed.
+- Avoid duplicating large prompt text in the visible agent reply.
 
 ## Pre-launch planning note (mandatory)
 
@@ -243,7 +248,8 @@ Wake payload frames continuation as the **same ongoing assistant conversation** 
 Continuation flow:
 - react briefly to Claude result
 - evaluate goal completion (gap analysis)
-- if gaps remain: explain next fix and, if needed, launch one follow-up run
+- if gaps remain and there is no real blocker requiring user input or external waiting: explain the next fix, then launch the next Claude run in the same turn
+- keep repeating this wake → visible decision → relaunch pattern for as many iterations as needed until the original goal is complete or a genuine blocker is hit
 - if complete: report final outcome and stop
 
 ### Deterministic wake guard (anti-duplicate)
@@ -257,6 +263,7 @@ Continuation flow:
 - On wake, agent must first post a visible decision turn:
   - `[TRACE][AGENT][WAKE_RECEIVED] ...`
   - `[TRACE][AGENT][DECISION] continue|stop ...`
+- If the goal is still not complete and there is no real blocker, the next Claude iteration is mandatory.
 - Only after that visible decision may the next Claude iteration be launched.
 ### Telegram notification flow (DM Threaded Mode — full pipeline):
 1. 🚀 **Launch notification** → thread ✅ (silent; HTML; `<blockquote expandable>` for prompt; via `send_telegram_direct`; includes `Resume: <session-id|new>`)
@@ -336,6 +343,7 @@ Telegram has two distinct thread models. The key difference for run-task.py is h
 - Task prompt prepended with `[Automation context: ... python3 /tmp/cc-notify-{pid}.py 'msg' ...]`
 - Claude Code calls the file (legitimate local script pattern, no safety warning)
 - Script automatically prepends `"📡 🟢 CC: "` to all messages; cleaned up in `finally` block
+- The same local script interface is now used for both Telegram and WhatsApp; transport differences stay inside the generated script
 
 ### Notification types
 
@@ -364,9 +372,14 @@ Telegram has two distinct thread models. The key difference for run-task.py is h
 ### Git requirement
 Claude Code needs a git repo. `run-task.py` auto-inits if missing.
 
-## Python 3.9 Compatibility
+## Python/runtime compatibility
 
-`run-task.py` uses `Optional[X]` from `typing` (not `X | None`) for compatibility with Python 3.9. The union syntax (`X | None`) requires Python 3.10+.
+`run-task.py` should stay runnable on plain system Python and must not rely on ambient third-party packages for core transport.
+
+Current compatibility rules:
+- use `Optional[X]` from `typing` (not `X | None`) so the script remains compatible with Python 3.9+
+- do not require `requests` for startup, routing validation, gateway tool calls, or Telegram Bot API calls
+- prefer stdlib transport for orchestration-critical paths so OpenClaw/runtime updates do not break the wrapper before launch
 
 ```python
 # Correct (3.9+)
@@ -376,6 +389,11 @@ def foo(x: Optional[str]) -> Optional[str]: ...
 # Would break on 3.9
 def foo(x: str | None) -> str | None: ...
 ```
+
+Practical lesson from 2026-04-14:
+- a runtime update left the wrapper running under Python 3.14 without `requests`
+- failure happened at import time (`ModuleNotFoundError`) before `--validate-only` could even test routing
+- system wrappers should fail on real orchestration problems, not on optional packaging drift
 
 ## Full E2E Test (reference)
 
@@ -394,12 +412,12 @@ Use this when you need to validate the **entire pipeline** in one run:
 5. Agent wake continuation is delivered (`openclaw agent --session-id ... --deliver`) and appears visibly in chat
 
 ### Interactive test rule (time budget)
-For interactive/iterate-mode testing, do **exactly one** continuation step after phase 1.
-- Phase 1: intentionally incomplete output (prove gap detected)
-- Continuation #1: close the gap and finish
-- Stop there; do not run multi-hop continuation loops during routine tests
+For routine interactive testing, prefer keeping the continuation chain short when that still validates the behavior you care about.
+- Phase 1 may intentionally leave a visible gap
+- Follow-up iterations should close the gap efficiently
+- But the general production rule still applies: if the real goal is not complete and there is no blocker, continue relaunching until it is complete
 
-Reason: keeps regression runs fast (minutes, not 20+ minutes) while still validating the critical iterate path.
+Reason: routine regression runs should stay reasonably fast, but production behavior should not stop early just because an intermediate iteration was incomplete.
 
 ### Visibility rule (mandatory)
 Between `✅ Claude Code completed` and any next `🚀 Claude Code started`, there must be a user-facing analysis message in the thread.
@@ -424,7 +442,7 @@ Recommended wording to include in prompt:
 - "Send another update after major milestone(s)"
 - "If task exceeds 60 seconds, send at least one heartbeat-style update"
 
-For thread-safe Telegram runs, updates should use the injected automation script (`/tmp/cc-notify-<pid>.py`).
+For Telegram and WhatsApp runs, updates should use the injected automation script (`/tmp/cc-notify-<pid>.py`).
 
 ### Canonical launch (minimal mode)
 ```bash

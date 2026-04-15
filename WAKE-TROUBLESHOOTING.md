@@ -216,18 +216,23 @@ If Claude ignored it, add an explicit instruction: `"Use python3 /tmp/cc-notify-
 
 ## 10. Iterative wake loop does not continue
 
-**Symptom:** Agent wakes, produces a summary, but does NOT re-launch a follow-up Claude run when more work was expected.
+**Symptom:** Agent wakes, produces a summary, but does NOT re-launch a follow-up Claude run even though the original goal is still unfinished.
 
 **Check:**
 - Confirm the wake analysis actually concluded that more work remains.
-- Confirm the agent was expected to launch a follow-up run, not just summarize and stop.
+- Confirm there was no real blocker requiring user input, approval, missing credentials, or external waiting.
 - Verify continuation turn actually received the wake payload for this run.
 
 **Debug:** Read the continuation turn output — it should contain gap analysis and a
-re-launch decision. If it says "done", inspect whether the result actually closed all requirements.
+re-launch decision. If it says some version of "needs another run" but does not actually launch one, the wake policy is too soft.
+If it says "done", inspect whether the result actually closed all requirements.
 
-**Fix:** Make the wake prompt explicitly state when a follow-up run is expected, and ensure the
-next-step gap explicit in the wake continuation summary.
+**Expected behavior:**
+- If the original goal is not complete, the agent should not stop at a diagnostic summary.
+- It must post a visible `[TRACE][AGENT][DECISION] continue ...` turn and then relaunch Claude Code.
+- This loop should repeat for as many iterations as needed until the goal is complete or a genuine blocker is hit.
+
+**Fix:** Make the wake prompt explicit that follow-up relaunch is mandatory whenever work remains and there is no real blocker. The continuation summary should name the next-step gap clearly, then actually launch the next run instead of stopping at analysis.
 
 ---
 

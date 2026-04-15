@@ -96,9 +96,9 @@ Real WhatsApp chat showing the full flow — task launch, progress updates, and 
 - [OpenClaw](https://docs.openclaw.ai) running locally (default port `18789`)
 - [Claude Code CLI](https://github.com/anthropics/claude-code) (`claude`) installed and authenticated
 - Claude Max subscription (for $0 API cost per task)
-- Python 3.10+ with `requests` (`pip install requests`)
-- WhatsApp and Telegram connected to OpenClaw (both tested)
-- Other channels may work in principle, but may require lightweight AI-assisted adaptation in `notify_session()` / channel routing logic
+- Python 3.10+
+- WhatsApp and Telegram connected to OpenClaw (both supported; WhatsApp validated end-to-end after the unified local notify change, Telegram path remains thread-routed)
+- Other channels may work in principle, but may require lightweight adaptation in routing / notification transport logic
 
 ---
 
@@ -220,6 +220,28 @@ prompt content comes from untrusted sources.
 
 ---
 
+## Important: why there is a `.git` inside the skill folder
+
+If you install this skill by cloning it directly into your OpenClaw skills directory, the skill folder itself will contain a `.git` directory.
+
+That is **intentional**.
+
+This skill is distributed as its own standalone Git repository, so:
+- the nested `.git` belongs to the skill repo itself
+- it is safe and expected
+- do **not** delete it as "cleanup"
+- do **not** try to reuse that nested `.git` as if it were OpenClaw's main repo
+- do **not** point coding agents at it unless you intentionally want them working on the public skill repository
+
+Why this note matters:
+- some coding agents see a `.git` folder and assume it is either junk to remove or the primary project repo to work in
+- both assumptions are wrong here
+- the `.git` exists so the public skill can be updated, versioned, diffed, and published independently of the main OpenClaw workspace
+
+Rule of thumb:
+- if you are **using** the skill, leave the nested `.git` alone
+- if you are **developing/updating** the skill itself, then yes, that nested `.git` is the correct repo for commits/tags/pushes
+
 ## Installation
 
 Clone into your OpenClaw skills directory:
@@ -237,11 +259,7 @@ cp ~/.openclaw/workspace/skills/claude-code-task/scripts/openclaw_notify.py \
    ~/.openclaw/workspace/scripts/openclaw_notify.py
 ```
 
-Install Python dependency:
-
-```bash
-pip install requests
-```
+No extra Python package is required for orchestration-critical transport. `run-task.py` uses stdlib HTTP paths for gateway and Telegram Bot API calls so runtime/package drift is less likely to break the wrapper on startup.
 
 Add the skill to your OpenClaw workspace by including `SKILL.md` in your agent's context — either via `workspace.files` in `openclaw.json` or by loading it in your bootstrap context.
 

@@ -32,10 +32,10 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-import requests
 import uuid
 import hashlib
 from typing import Optional
+from urllib import request as urllib_request, error as urllib_error
 
 # Import session registry
 try:
@@ -134,13 +134,39 @@ def build_whatsapp_group_session_key(base_session_key: str, group_jid: str) -> O
     return f"agent:{agent_id}:whatsapp:group:{group_jid}"
 
 
+class _SimpleResponse:
+    def __init__(self, status_code: int, text: str, headers: Optional[dict] = None):
+        self.status_code = status_code
+        self.text = text
+        self.headers = headers or {}
+
+    def json(self):
+        return json.loads(self.text)
+
+
+def http_post(url: str, *, headers: Optional[dict] = None, json_body=None, timeout: int = 20) -> _SimpleResponse:
+    data = None
+    final_headers = dict(headers or {})
+    if json_body is not None:
+        data = json.dumps(json_body).encode("utf-8")
+        final_headers.setdefault("Content-Type", "application/json")
+    req = urllib_request.Request(url, data=data, headers=final_headers, method="POST")
+    try:
+        with urllib_request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            return _SimpleResponse(resp.status, body, dict(resp.headers))
+    except urllib_error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        return _SimpleResponse(e.code, body, dict(getattr(e, "headers", {}) or {}))
+
+
 def _invoke_tool(token: str, tool: str, args: dict, timeout: int = 20) -> Optional[dict]:
     """Invoke OpenClaw tool via gateway; return parsed JSON or None."""
     try:
-        resp = requests.post(
+        resp = http_post(
             f"{GW_URL}/tools/invoke",
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json={"tool": tool, "args": args},
+            json_body={"tool": tool, "args": args},
             timeout=timeout,
         )
         if resp.status_code != 200:
@@ -366,9 +392,9 @@ def send_telegram_direct(
             payload["message_thread_id"] = int(thread_id)
         if reply_to:
             payload["reply_to_message_id"] = int(reply_to)
-        resp = requests.post(
+        resp = http_post(
             f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            json=payload,
+            json_body=payload,
             timeout=15,
         )
         if resp.status_code != 200:
@@ -400,9 +426,9 @@ def edit_telegram_direct(
         }
         if parse_mode:
             payload["parse_mode"] = parse_mode
-        resp = requests.post(
+        resp = http_post(
             f"https://api.telegram.org/bot{bot_token}/editMessageText",
-            json=payload,
+            json_body=payload,
             timeout=15,
         )
         if resp.status_code != 200:
@@ -447,10 +473,10 @@ def send_channel(token: str, session_key: str, text: str, bg_prefix: bool = True
             return
         if reply_to and channel == "telegram":
             args["replyTo"] = str(reply_to)
-        requests.post(
+        http_post(
             f"{GW_URL}/tools/invoke",
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json={"tool": "message", "args": args},
+            json_body={"tool": "message", "args": args},
             timeout=15,
         )
     except Exception:
@@ -552,10 +578,10 @@ def notify_session(token: str, session_key: str, group_jid: Optional[str], messa
             f"Then reply NO_REPLY to avoid duplicate. Do NOT rely on announce step."
         )
         try:
-            resp = requests.post(
+            resp = http_post(
                 f"{GW_URL}/tools/invoke",
                 headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                json={"tool": "sessions_send",
+                json_body={"tool": "sessions_send",
                       "args": {"sessionKey": wake_session_key, "message": agent_msg}},
                 timeout=30,
             )
@@ -1028,10 +1054,10 @@ def main():
 
         # Build claude command
         # Create a progress notification script on disk so Claude Code can send
-        # mid-task updates without seeing the bot token in the prompt (which triggers
-        # prompt-injection warnings in Claude Code's safety checks).
+        # mid-task updates through a single local interface, regardless of channel.
+        # This avoids exposing bot tokens or transport details in the task prompt.
         notify_script_path = None
-        if thread_id and _ch == "telegram" and _tgt:
+        if _ch == "telegram" and _tgt and thread_id:
             bot_token_for_script = get_telegram_bot_token()
             if bot_token_for_script:
                 notify_script_path = f"/tmp/cc-notify-{os.getpid()}.py"
@@ -1054,6 +1080,50 @@ def main():
                         "    print(f'notify error: {e}', file=sys.stderr)\n"
                     )
                 os.chmod(notify_script_path, 0o755)
+        elif _ch == "whatsapp" and _tgt and token:
+            notify_script_path = f"/tmp/cc-notify-{os.getpid()}.py"
+            with open(notify_script_path, "w") as _nf:
+                _nf.write(
+                    "#!/usr/bin/env python3\n"
+                    "import sys, json\n"
+                    "from urllib import request as urllib_request, error as urllib_error\n"
+                    f"GW_URL = '{GW_URL}'\n"
+                    f"TOKEN = {json.dumps(token)}\n"
+                    f"TARGET = {json.dumps(_tgt)}\n"
+                    "try:\n"
+                    "    raw = sys.argv[1] if len(sys.argv) > 1 else 'Progress update'\n"
+                    "    prefix = '📡 🟢 CC: '\n"
+                    "    msg = raw if raw.startswith(prefix) else (prefix + raw)\n"
+                    "    payload = json.dumps({\n"
+                    "        'tool': 'message',\n"
+                    "        'args': {\n"
+                    "            'action': 'send',\n"
+                    "            'channel': 'whatsapp',\n"
+                    "            'target': TARGET,\n"
+                    "            'message': msg,\n"
+                    "        }\n"
+                    "    }).encode('utf-8')\n"
+                    "    req = urllib_request.Request(\n"
+                    "        f'{GW_URL}/tools/invoke',\n"
+                    "        data=payload,\n"
+                    "        headers={\n"
+                    "            'Authorization': f'Bearer {TOKEN}',\n"
+                    "            'Content-Type': 'application/json',\n"
+                    "        },\n"
+                    "        method='POST'\n"
+                    "    )\n"
+                    "    with urllib_request.urlopen(req, timeout=15) as resp:\n"
+                    "        body = resp.read().decode('utf-8', errors='replace')\n"
+                    "        print(body)\n"
+                    "except urllib_error.HTTPError as e:\n"
+                    "    body = e.read().decode('utf-8', errors='replace')\n"
+                    "    print(f'notify http error: {e.code}: {body}', file=sys.stderr)\n"
+                    "    sys.exit(1)\n"
+                    "except Exception as e:\n"
+                    "    print(f'notify error: {e}', file=sys.stderr)\n"
+                    "    sys.exit(1)\n"
+                )
+            os.chmod(notify_script_path, 0o755)
 
         # Prepend system context about notification script (avoids prompt-injection warnings)
         base_task = args.task
