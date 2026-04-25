@@ -1,6 +1,45 @@
 # TECHNICAL INSIGHTS — claude-code-task
 
-## 0) 2026-04-14 runtime compatibility lesson
+## 0) 2026-04-24 Two-mode wrapper: standard + true Fast mode
+
+The wrapper now exposes only two execution modes:
+
+- **standard** — claude is invoked with no model flag. The CLI picks its current default.
+- **fast** — wrapper requests true Claude Code Fast mode via subscription/OAuth auth.
+
+Local finding on Claude Code 2.1.119:
+- `claude -p --fast ...` still returns `unknown option '--fast'`.
+- `ANTHROPIC_API_KEY=... claude -p --settings '{"fastMode":true}' --model claude-opus-4-6 ...` returns standard speed / fast not on.
+- `env -u ANTHROPIC_API_KEY claude -p --settings '{"fastMode":true}' --model claude-opus-4-6 ...` returns `speed: "fast"` and `fast_mode_state: "on"` after extra usage is enabled.
+
+Therefore every wrapper path, not just fast mode, must remove `ANTHROPIC_API_KEY` from the child process environment so Claude Code uses the logged-in OAuth/subscription session. This is a hard billing invariant to prevent accidental API spend. Fast mode should prefer native `claude -p --fast` if a future CLI exposes it; otherwise use the working settings/model fallback.
+
+Earlier insight that remains valid:
+- `--effort low` is a different mechanism (deliberation budget on the current model). The wrapper does **not** map `--fast` onto `--effort low`.
+
+## 1) 2026-04-22 memory_search reindex root cause + tail-hang lesson
+- A seemingly "hung" OpenClaw session after `read skill -> memory_search` was not model reasoning drift, but blocking local indexing triggered by `agents.defaults.memorySearch.extraPaths` containing `~/SharedWorkspace`.
+- In this environment that path was enormous (~15GB / 169K files), so every `memory_search` could trigger a long full reindex instead of a quick lookup.
+- The practical operator symptom was deceptive:
+  - assistant looked stuck right after `memory_search`,
+  - gateway stayed alive,
+  - but the tool call could sit for ~16-20 minutes while SharedWorkspace indexing churned.
+- Concrete evidence pattern that confirmed it:
+  - gateway log showed a `memory_search` call lasting ~16 minutes,
+  - `lsof` on the gateway process showed huge `.tmp-*` sqlite-related files open and growing,
+  - after removing SharedWorkspace from `extraPaths`, those SharedWorkspace file descriptors disappeared and only small workspace/memory files remained.
+- Durable fix in this environment:
+  - set `agents.defaults.memorySearch.extraPaths` to `[]` (or keep it strictly limited to small intentional memory corpora),
+  - do not point memory search at giant operational workspaces.
+- Cleanup lesson:
+  - interrupted indexing can strand large orphaned `.tmp-*` files and silently waste tens of GB,
+  - cleanup should be part of the incident runbook after fixing the config.
+- Separate but related wrapper lesson from the same incident:
+  - Claude Code itself may finish substantive work and emit a result, yet `claude -p` can remain alive in a tail-hang state,
+  - `run-task.py` currently detects this (`result_seen but process still alive after grace`) but in `observe` mode only warns instead of terminating,
+  - this can create a second false impression that "the investigation is still running" even after the root cause is already found.
+
+## 2) 2026-04-14 runtime compatibility lesson
 - `run-task.py` must not depend on ambient third-party Python packages for basic transport.
 - Real failure observed after runtime/OpenClaw update:
   - wrapper started under Python 3.14,

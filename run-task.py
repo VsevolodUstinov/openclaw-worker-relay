@@ -357,6 +357,18 @@ def get_telegram_bot_token() -> Optional[str]:
     return None
 
 
+def claude_code_child_env() -> dict:
+    """Return the only allowed environment for launching Claude Code.
+
+    Hard safety invariant: claude-code-task must NEVER pass ANTHROPIC_API_KEY to
+    Claude Code. This keeps runs on the logged-in Claude Code subscription/OAuth
+    path instead of accidentally burning API credits.
+    """
+    env = os.environ.copy()
+    env.pop("ANTHROPIC_API_KEY", None)
+    return env
+
+
 def send_telegram_direct(
     chat_id: str,
     text: str,
@@ -713,6 +725,48 @@ def format_tokens(n: int) -> str:
         return f"{n//1000}K"
 
 
+def format_cost_summary(state: dict) -> str:
+    """Format completion-only cost/usage summary.
+
+    Billing label rules:
+    - Standard Claude Code task path: show subscription.
+    - Fast mode / explicit token-billed paths: show estimated dollar cost when present.
+    - If no result/usage data exists, return empty string.
+    """
+    parts = []
+    cost = state.get("result_cost_usd")
+    usage = state.get("result_usage") or {}
+    in_tok = usage.get("input_tokens", 0) or 0
+    out_tok = usage.get("output_tokens", 0) or 0
+    cache_read = usage.get("cache_read_input_tokens", 0) or 0
+    cache_write = usage.get("cache_creation_input_tokens", 0) or 0
+    num_turns = state.get("result_num_turns")
+
+    has_usage = bool(in_tok or out_tok or cache_write or cache_read or num_turns)
+    billing_label = state.get("billing_label")
+    if billing_label == "subscription":
+        if has_usage or state.get("result_seen"):
+            parts.append("subscription")
+    elif cost is not None:
+        parts.append(f"~${cost:.4f} est.")
+    elif billing_label == "fast":
+        if has_usage or state.get("result_seen"):
+            parts.append("fast extra usage (cost unavailable)")
+    elif has_usage or state.get("result_seen"):
+        parts.append("subscription")
+
+    if has_usage:
+        tok_str = f"in:{format_tokens(in_tok)} out:{format_tokens(out_tok)}"
+        if cache_read:
+            tok_str += f" cache↩:{format_tokens(cache_read)}"
+        if cache_write:
+            tok_str += f" cache↑:{format_tokens(cache_write)}"
+        parts.append(tok_str)
+    if num_turns:
+        parts.append(f"turns:{num_turns}")
+    return " | ".join(parts) if parts else ""
+
+
 def parse_stream_line(line: str, state: dict):
     """Parse stream-json line for activity tracking, session ID capture, and active subagent count."""
     try:
@@ -730,11 +784,14 @@ def parse_stream_line(line: str, state: dict):
             inner = data.get("event", {})
             inner_type = inner.get("type", "")
 
-        # Capture session_id from init event
+        # Capture session_id and resolved model from init event
         if msg_type == "system" and data.get("subtype") == "init":
             session_id = data.get("session_id")
             if session_id:
                 state["session_id"] = session_id
+            model = data.get("model")
+            if model:
+                state["resolved_model"] = model
 
         # Content block events (from --include-partial-messages)
         # Can arrive as top-level OR inside stream_event envelope
@@ -817,6 +874,22 @@ def parse_stream_line(line: str, state: dict):
             state["result_seen"] = True
             state["result_seen_time"] = time.time()
             state["last_activity"] = "✅ finishing..."
+            # Capture cost and usage from result event
+            cost = data.get("total_cost_usd") or data.get("cost_usd")
+            if cost is not None and state.get("result_cost_usd") is None:
+                state["result_cost_usd"] = cost
+            usage = data.get("usage")
+            if usage and state.get("result_usage") is None:
+                state["result_usage"] = usage
+            dur = data.get("duration_ms")
+            if dur is not None and state.get("result_duration_ms") is None:
+                state["result_duration_ms"] = dur
+            turns = data.get("num_turns")
+            if turns is not None and state.get("result_num_turns") is None:
+                state["result_num_turns"] = turns
+            model = data.get("model")
+            if model and state.get("resolved_model") is None:
+                state["resolved_model"] = model
 
         if semantic_progress:
             state["last_semantic_progress_time"] = time.time()
@@ -845,7 +918,24 @@ def main():
     parser.add_argument("--telegram-routing-mode", choices=["auto", "thread-only", "allow-non-thread"], default="auto", help="Telegram routing policy (default: auto)")
     parser.add_argument("--trace-live", action="store_true",
                         help="Send live technical trace events to chat/thread for debugging")
+
+    # Execution mode: only two modes at the wrapper level.
+    #   normal (default) — invoke claude with no explicit model flag.
+    #   fast (--fast)    — request true Claude Code Fast mode via subscription/OAuth path.
+    # Current local CLI (2.1.119) does not expose a literal `claude -p --fast` flag yet,
+    # but `--settings {"fastMode":true}` works when ANTHROPIC_API_KEY is removed so
+    # Claude Code uses the logged-in OAuth/subscription session. If a future CLI exposes
+    # native `--fast`, the command builder below will use it automatically.
+    parser.add_argument(
+        "--fast", action="store_true",
+        help="Run in true Claude Code Fast mode via subscription/OAuth path. "
+             "Without this flag, the wrapper invokes claude with no explicit model.",
+    )
     args = parser.parse_args()
+
+    mode_label = "fast" if args.fast else "standard"
+    claude_env = claude_code_child_env()
+    billing_label = "fast" if args.fast else "subscription"
 
     # Set notification globals (channel hint; target must be resolved deterministically)
     global NOTIFY_CHANNEL_OVERRIDE, NOTIFY_TARGET_OVERRIDE
@@ -981,6 +1071,8 @@ def main():
         print(f"   target: {tgt}")
         print(f"   notify_session_id: {notify_session_id}")
         print(f"   allow_main_telegram: {args.allow_main_telegram}")
+        print(f"   mode: {mode_label}")
+        print("   auth: subscription/OAuth (ANTHROPIC_API_KEY stripped)")
         if session_meta:
             print(f"   resolved_session_id: {session_meta.get('sessionId')}")
             print(f"   resolved_telegram_target: {session_meta.get('telegramTarget')}")
@@ -999,6 +1091,8 @@ def main():
         print(f"   Task: {args.task[:100]}", file=sys.stderr)
         print(f"   Project: {project}", file=sys.stderr)
         print(f"   Output: {output_file}", file=sys.stderr)
+        print(f"   Mode: {mode_label}", file=sys.stderr)
+        print("   Auth: subscription/OAuth (ANTHROPIC_API_KEY stripped)", file=sys.stderr)
         print(f"   Timeout: {args.timeout}s ({args.timeout//60}min)", file=sys.stderr)
         print(f"   Stall idle timeout: {STALL_IDLE_TIMEOUT}s ({STALL_IDLE_TIMEOUT//60}min)", file=sys.stderr)
         print(f"   Stall guard mode: observe (shadow)", file=sys.stderr)
@@ -1020,6 +1114,8 @@ def main():
             if args.session_label:
                 launch_parts.append(f"*Label:* {args.session_label}")
             launch_parts.append(f"*Project:* {project}")
+            launch_parts.append(f"*Mode:* {mode_label}")
+            launch_parts.append("*Auth:* subscription/OAuth (ANTHROPIC_API_KEY stripped)")
             launch_parts.append(f"*Timeout:* {fmt_duration(args.timeout)}")
             launch_parts.append(f"*Resume:* {resume_display}")
             launch_parts.append(f"*PID:* {os.getpid()}")
@@ -1031,6 +1127,8 @@ def main():
             if args.session_label:
                 html_parts.append(f"<b>Label:</b> {_esc(args.session_label)}")
             html_parts.append(f"<b>Project:</b> {_esc(str(project))}")
+            html_parts.append(f"<b>Mode:</b> {_esc(mode_label)}")
+            html_parts.append("<b>Auth:</b> subscription/OAuth (ANTHROPIC_API_KEY stripped)")
             html_parts.append(f"<b>Timeout:</b> {_esc(fmt_duration(args.timeout))}")
             html_parts.append(f"<b>Resume:</b> {_esc(resume_display)}")
             html_parts.append(f"<b>PID:</b> {os.getpid()}")
@@ -1146,15 +1244,48 @@ def main():
                 f"[Automation context: a progress notification script is available at "
                 f"{notify_script_path}. Run it with: "
                 f"python3 {notify_script_path} 'your message text' — this sends a "
-                f"message to the task owner. Use it once during the task to confirm progress.]\n\n"
+                f"message to the task owner. Use it once during the task to confirm progress. "
+                f"Before starting any deliberate wait/sleep/backoff/rate-limit pause longer than "
+                f"60 seconds, you MUST send a progress notification stating how long you are "
+                f"about to wait and why, e.g. 'Waiting 15 minutes for X rate limit reset.' "
+                f"Then send another progress notification when the wait is over.]\n\n"
                 + base_task
             )
 
-        claude_cmd = ["claude", "-p", task_prompt, "--dangerously-skip-permissions",
-                      "--verbose", "--output-format", "stream-json",
-                      "--include-partial-messages"]
+        # Two execution modes:
+        #   normal — no model flag (let claude pick its current default).
+        #   fast   — true Claude Code Fast mode via subscription/OAuth path.
+        # Prefer native `claude -p --fast` when the installed CLI exposes it. On local
+        # 2.1.119, that flag is not present; the working headless mechanism is
+        # `--settings {"fastMode":true}` with the API key removed so Claude Code uses
+        # the logged-in OAuth/subscription session. The temporary model pin is required
+        # by the current API fast-mode contract and should be removed once native
+        # `--fast` is available.
+        claude_cmd = ["claude", "-p"]
+        if args.fast:
+            help_probe = subprocess.run(
+                ["claude", "-p", "--help"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=claude_env,
+            )
+            help_text = (help_probe.stdout or "") + (help_probe.stderr or "")
+            if "--fast" in help_text:
+                claude_cmd.append("--fast")
+            else:
+                claude_cmd.extend([
+                    "--settings", '{"fastMode":true}',
+                    "--model", "claude-opus-4-6",
+                ])
 
-        # Add resume flag if provided
+        claude_cmd.extend([
+            task_prompt,
+            "--dangerously-skip-permissions",
+            "--verbose", "--output-format", "stream-json",
+            "--include-partial-messages",
+        ])
+
         if args.resume:
             claude_cmd.extend(["--resume", args.resume])
 
@@ -1165,6 +1296,7 @@ def main():
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            env=claude_env,
         )
 
         # Activity tracking state
@@ -1172,7 +1304,8 @@ def main():
             "tool_calls": 0,
             "files_written": [],
             "last_activity": "",
-            "session_id": None,  # Will be captured from stream-json init event
+            "session_id": None,         # Captured from stream-json init event
+            "resolved_model": None,      # Actual model name from init/result event
             "last_event_time": time.time(),
             "last_semantic_progress_time": time.time(),
             "output_tokens": 0,
@@ -1180,9 +1313,15 @@ def main():
             "active_subagent_ids": set(),
             "result_seen": False,
             "result_seen_time": None,
+            "billing_label": billing_label,
             "last_progress_signature": None,
             "flat_heartbeats": 0,
             "stall_notice_sent": False,
+            # Result-level cost and usage (populated from stream-json result event)
+            "result_cost_usd": None,
+            "result_usage": None,
+            "result_duration_ms": None,
+            "result_num_turns": None,
         }
 
         start = time.time()
@@ -1306,13 +1445,23 @@ def main():
                 print("📨 Resume failure notified", file=sys.stderr)
             return  # Exit early, don't process output
 
-        # Extract final text from stream-json
+        # Extract final text from stream-json; also capture cost/usage if not already in state
         final_text = ""
         for line in output_lines:
             try:
                 data = json.loads(line)
                 if data.get("type") == "result":
                     final_text = data.get("result", "")
+                    if state.get("result_cost_usd") is None:
+                        state["result_cost_usd"] = data.get("total_cost_usd") or data.get("cost_usd")
+                    if state.get("result_usage") is None:
+                        state["result_usage"] = data.get("usage")
+                    if state.get("result_duration_ms") is None:
+                        state["result_duration_ms"] = data.get("duration_ms")
+                    if state.get("result_num_turns") is None:
+                        state["result_num_turns"] = data.get("num_turns")
+                    if state.get("resolved_model") is None:
+                        state["resolved_model"] = data.get("model")
                     break
             except (json.JSONDecodeError, KeyError):
                 pass
@@ -1378,6 +1527,23 @@ def main():
             def _e(s: str) -> str:
                 return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
+            # Mode is always known. Model is shown only if Claude reported it via
+            # the init/result event. We never claim a pinned model the wrapper did
+            # not actually pass.
+            resolved_model = state.get("resolved_model")
+            cost_summary = format_cost_summary(state)
+            finish_status_parts = [f"Mode: {mode_label}"]
+            if resolved_model:
+                finish_status_parts.append(f"Model: {resolved_model}")
+            finish_status_line = " | ".join(finish_status_parts)
+            finish_status_html_parts = [f"<b>Mode:</b> {_e(mode_label)}"]
+            if resolved_model:
+                finish_status_html_parts.append(f"<b>Model:</b> {_e(resolved_model)}")
+            finish_status_html = " | ".join(finish_status_html_parts)
+            finish_cost_html = (
+                f"<b>Est. cost:</b> {_e(cost_summary)}\n" if cost_summary else ""
+            )
+
             if stalled_out:
                 elapsed = fmt_duration(int(time.time() - start))
                 msg = (
@@ -1385,7 +1551,9 @@ def main():
                     f"(idle limit: {fmt_duration(STALL_IDLE_TIMEOUT)})\n\n"
                     f"Task: {args.task[:200]}\n"
                     f"Project: {project}\n"
-                    f"Tool calls: {state['tool_calls']}\n\n"
+                    f"{finish_status_line}\n"
+                    + (f"Est. cost: {cost_summary}\n" if cost_summary else "")
+                    + f"Tool calls: {state['tool_calls']}\n\n"
                     f"Partial result ({output_size} chars):\n\n{preview}\n\n"
                     f"Full output: {output_file}"
                 )
@@ -1394,6 +1562,8 @@ def main():
                     f"(idle limit: {_e(fmt_duration(STALL_IDLE_TIMEOUT))})\n\n"
                     f"<b>Task:</b> {_e(args.task[:200])}\n"
                     f"<b>Project:</b> {_e(str(project))}\n"
+                    f"{finish_status_html}\n"
+                    f"{finish_cost_html}"
                     f"<b>Tool calls:</b> {state['tool_calls']}\n\n"
                     f"<b>Partial result</b> ({output_size} chars):\n"
                     f"<blockquote expandable>{_e(preview)}</blockquote>\n"
@@ -1406,7 +1576,9 @@ def main():
                     f"(limit: {fmt_duration(args.timeout)})\n\n"
                     f"Task: {args.task[:200]}\n"
                     f"Project: {project}\n"
-                    f"Tool calls: {state['tool_calls']}\n\n"
+                    f"{finish_status_line}\n"
+                    + (f"Est. cost: {cost_summary}\n" if cost_summary else "")
+                    + f"Tool calls: {state['tool_calls']}\n\n"
                     f"Partial result ({output_size} chars):\n\n{preview}\n\n"
                     f"Full output: {output_file}"
                 )
@@ -1415,6 +1587,8 @@ def main():
                     f"(limit: {_e(fmt_duration(args.timeout))})\n\n"
                     f"<b>Task:</b> {_e(args.task[:200])}\n"
                     f"<b>Project:</b> {_e(str(project))}\n"
+                    f"{finish_status_html}\n"
+                    f"{finish_cost_html}"
                     f"<b>Tool calls:</b> {state['tool_calls']}\n\n"
                     f"<b>Partial result</b> ({output_size} chars):\n"
                     f"<blockquote expandable>{_e(preview)}</blockquote>\n"
@@ -1426,13 +1600,17 @@ def main():
                     f"✅ Claude Code task complete!\n\n"
                     f"Task: {args.task[:200]}\n"
                     f"Project: {project}\n"
-                    f"Result ({output_size} chars):\n\n{preview}\n{trunc}\n"
+                    f"{finish_status_line}\n"
+                    + (f"Est. cost: {cost_summary}\n" if cost_summary else "")
+                    + f"Result ({output_size} chars):\n\n{preview}\n{trunc}\n"
                     f"Full output: {output_file}"
                 )
                 html_msg = (
                     f"✅ <b>Claude Code task complete!</b>\n\n"
                     f"<b>Task:</b> {_e(args.task[:200])}\n"
                     f"<b>Project:</b> {_e(str(project))}\n"
+                    f"{finish_status_html}\n"
+                    f"{finish_cost_html}"
                     f"<b>Result</b> ({output_size} chars):\n"
                     f"<blockquote expandable>{_e(preview)}</blockquote>\n"
                     f"{_e(trunc)}"
@@ -1442,12 +1620,15 @@ def main():
                 msg = (
                     f"❌ Claude Code error (exit {exit_code})\n\n"
                     f"Task: {args.task[:200]}\n"
-                    f"Project: {project}\n\n{preview}"
+                    f"Project: {project}\n"
+                    f"{finish_status_line}\n\n"
+                    f"{preview}"
                 )
                 html_msg = (
                     f"❌ <b>Claude Code error</b> (exit {exit_code})\n\n"
                     f"<b>Task:</b> {_e(args.task[:200])}\n"
-                    f"<b>Project:</b> {_e(str(project))}\n\n"
+                    f"<b>Project:</b> {_e(str(project))}\n"
+                    f"{finish_status_html}\n\n"
                     f"<blockquote expandable>{_e(preview)}</blockquote>"
                 )
 

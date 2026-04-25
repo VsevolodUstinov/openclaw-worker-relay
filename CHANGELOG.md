@@ -1,26 +1,97 @@
 # CHANGELOG — claude-code-task
 
-## 2026-04-15 (unified local progress notify contract)
+## 2026-04-24 (two-mode wrapper: standard + `--fast`)
+
+### Changed (product simplification)
+
+- Wrapper now exposes exactly **two execution modes**:
+  - `standard` (default) — claude is invoked with **no model flag**; the CLI picks its current default.
+  - `fast` (`--fast`) — wrapper requests true Claude Code Fast mode via subscription/OAuth auth.
+- Removed the previous explicit `--model opus` default. The wrapper no longer pins any model in standard mode.
+- Removed the prior `--fast` fail-fast guard and the unsupported-mode error message. There is no mapping to `--effort low`.
+- Hard billing invariant: all Claude Code child processes are launched with `ANTHROPIC_API_KEY` stripped from the environment, so `claude-code-task` cannot accidentally burn API credits. Runs use the logged-in subscription/OAuth path.
+- Fast implementation detail: prefer native `claude -p --fast` when a future CLI exposes it; on local 2.1.119 use `--settings '{"fastMode":true}' --model claude-opus-4-6` under the same stripped-env OAuth/subscription path.
+- Fast mode cost guard documented: roughly **$30 per 10 minutes of continuous work**; use `--fast` only when the user explicitly asks for Fast/Fast mode/urgent speed.
+- Removed the `--large-context` advisory flag and all "1M (Opus default)" / "Context: …" annotations from the launch, completion, and validate-only output. With no model pinning the annotation was misleading; the two-mode mental model is the entire wrapper surface.
+
+### Notifications
+
+- Launch (Markdown + HTML) and startup logs now include a single `Mode: standard|fast` line in place of the old `Model: opus | Context: …` line.
+- Completion (success / timeout / stall / error) notifications include `Mode: <mode>` always; `Model: <resolved>` is appended only when Claude reports a model name via the stream-json `init`/`result` event. The wrapper never asserts a pinned model it didn't pass.
+- Cost semantics tightened: standard Claude Code task completion reports `Est. cost: subscription` for the stripped-env subscription path, but Fast mode reports dollar estimates from `total_cost_usd` because it consumes paid extra usage even under subscription/OAuth auth.
+- `--validate-only` output simplified: prints `mode: standard|fast` and drops the previous `model`, `context`, `fast_mode` lines.
+- Automation context now tells Claude to announce any deliberate wait/sleep/backoff/rate-limit pause longer than 60 seconds before starting it, including expected duration and reason, then notify again when the wait ends.
+  - Validated with a real `sleep 70` regression run (`STATUS: PASS`) and a deterministic shim test confirming the wait-notice instruction is present in the child Claude prompt.
+
+### Files changed
+
+- `run-task.py` — argparse, validate-only, startup log, launch (Markdown+HTML), claude_cmd assembly, completion model line.
+- `SKILL.md` — Execution Modes section, Claude Code Flags section, Current Stable Behavior section.
+- `CHANGELOG.md` — this entry.
+
+## 2026-04-24 (superseded — Opus default + `--fast` fail-fast + estimated cost reporting)
+
+### Added
+
+- **`--model opus` always explicit in claude command.** Using the alias (not pinned version) ensures forward compatibility when Anthropic updates the Opus line without requiring code changes.
+  - Live testing confirms: `opus` resolves to `claude-opus-4-7` with a 1M context window by default.
+
+- **`--large-context` flag:** advisory annotation for long-context tasks.
+  - Confirmed: `--model opus` already resolves to a model with `contextWindow=1000000` by default.
+  - Flag adds "1M (explicit)" annotation to launch/completion notifications; does not change model behavior.
+  - `CLAUDE_CODE_DISABLE_1M_CONTEXT` env var can be used to disable 1M context if needed (Claude Code built-in).
+
+- **Estimated cost in completion notifications:** parsed from `total_cost_usd`, `usage`, `num_turns` in the stream-json result event.
+  - Format: `~$X.XXXX est. | in:NNK out:NNK [cache↩:NNK] [cache↑:NNK] | turns:N`
+  - `cache↩` = cache-read tokens; `cache↑` = cache-creation tokens (often the dominant cost component).
+  - Labeled "est." to distinguish from authoritative billing (Max subscription accounting differs from per-token API cost).
+  - Cost line included in success, stall, and timeout completion notifications when data is available; absent on error paths where result event never fired.
+
+- **Resolved model name in notifications:** captured from `system/init` (init event) and `result` event in stream-json. Launch and completion notifications show the actual resolved model (e.g. `claude-opus-4-7`).
+
+- **`--validate-only` output extended:** now shows `model`, `context`, and `fast_mode` availability alongside routing info.
+
+### `--fast` — intentionally unsupported (fail-fast)
+
+- **An earlier draft of this release silently mapped `--fast` → `--effort low`. That mapping has been removed.** `--effort` (deliberation budget) and `/fast` (Fast mode) are distinct mechanisms. Labeling the effort-low flag as "fast" misrepresented what the wrapper was actually doing, and was explicitly rejected.
+- **True Fast mode cannot be enabled via this wrapper.** Verified empirically with claude CLI 2.1.119 under `ANTHROPIC_API_KEY` auth:
+  - `claude -p --model claude-opus-4-6 --settings '{"fastMode":true}'` → `fast_mode_state: "off"`, `speed: "standard"`.
+  - stream-json input `/fast on` → `"/fast isn't available in this environment."`.
+  - Binary strings explicitly emit: `"Fast mode is not available in the Agent SDK"`, and `"Fast mode requires a paid subscription"` when auth is OAuth/free or `"Fast mode unavailable during evaluation..."` when auth is an API key.
+  - Two preconditions fail simultaneously: (1) Fast mode requires a Claude subscription OAuth session, not `ANTHROPIC_API_KEY`; (2) Fast mode is not available in Agent SDK / non-interactive `-p` mode.
+- **New behavior:** passing `--fast` prints a detailed error and exits with code 2. The user-facing message explains both preconditions and suggests `--effort low` passed directly to the claude CLI as a distinct lower-latency option the caller can choose themselves.
 
 ### Changed
-- `run-task.py` now generates the same local `cc-notify` interface for both Telegram and WhatsApp:
-  - `python3 /tmp/cc-notify-<pid>.py "message"`
-- Channel/backend selection now happens inside the generated script:
-  - Telegram keeps the existing thread-safe direct Bot API path
-  - WhatsApp now uses the same local-script contract, backed by gateway `message.send`
 
-### Why it matters
-- Claude Code now sees one consistent mid-task progress interface across channels.
-- This removes the old split where Telegram used an injected local script but WhatsApp depended on separate prompt/tooling conventions (`openclaw_notify.py --bg`).
-- Result: simpler prompts, less docs/runtime drift, easier testing.
+- All completion notification paths (success, timeout, stall, error) updated to include `Model | Context` line and estimated cost summary.
+- Launch notification updated to include `Model | Context` line.
+- Startup log prints now include `Model | Context`.
 
-### Validation
-- WhatsApp helper-path E2E confirmed that mid-task progress delivery still works.
-- Unified WhatsApp regression confirmed:
-  - start notify delivered
-  - second notify after sleep delivered
-  - completion delivered
-  - gateway returned distinct `messageId` / `runId` values with `ok:true`
+### Technical details
+
+- `parse_stream_line`: captures `model` from `system/init` event → `state["resolved_model"]`; captures `total_cost_usd`, `usage`, `duration_ms`, `num_turns` from `result` event. (`fast_mode_state` is no longer tracked — always `"off"` under this wrapper.)
+- `format_cost_summary()`: new helper that formats estimated cost + token usage for completion messages.
+- State dict extended with: `resolved_model`, `result_cost_usd`, `result_usage`, `result_duration_ms`, `result_num_turns`.
+
+## 2026-04-22 (memory_search hang diagnosis + operator docs update)
+
+### Documented
+- Captured a production incident where an apparent OpenClaw "hang" after `memory_search` was caused by `agents.defaults.memorySearch.extraPaths` including `~/SharedWorkspace`, which triggered blocking reindex work on a very large tree (~15GB / 169K files).
+- Documented the concrete evidence pattern for this failure mode:
+  - very long `memory_search` duration in gateway logs,
+  - large growing `.tmp-*` files held open by the gateway process,
+  - disappearance of SharedWorkspace-related file descriptors after config correction.
+- Recorded the paired operator lesson that a Claude Code run can also appear hung after finishing substantive work because `run-task.py` tail-hang detection is currently `observe`-only after `result_seen`.
+
+### Operational impact
+- Clarifies that not every post-tool "hang" is model reasoning or routing failure; local memory index scope can be the real blocker.
+- Establishes that giant operational repos like SharedWorkspace must not be placed in `memorySearch.extraPaths`.
+- Adds a durable reminder that incident cleanup may include deleting orphaned sqlite temp files left by interrupted indexing.
+
+### Documentation
+- Updated `TECHNICAL-INSIGHTS.md` with the new root-cause pattern, evidence checklist, and the distinction between:
+  - the original OpenClaw hang root cause (`memory_search` reindex scope), and
+  - the separate Claude Code wrapper tail-hang behavior after `result_seen`.
 
 ## 2026-04-14 (OpenClaw runtime compatibility fix)
 

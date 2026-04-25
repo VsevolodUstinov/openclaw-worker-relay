@@ -358,11 +358,64 @@ Telegram has two distinct thread models. The key difference for run-task.py is h
 | Crash | 💥 | send_channel + sessions_send | send_telegram_direct (HTML) + openclaw agent | ✅ message_thread_id |
 | Agent continuation reply | 🤖 | — | openclaw agent wake (`--deliver`) | ✅ visible in chat |
 
+## Execution Modes
+
+The wrapper exposes exactly two execution modes. No advisory flags.
+
+Hard billing invariant: `run-task.py` always strips `ANTHROPIC_API_KEY` from the Claude Code child process environment. Claude Code task runs must use the logged-in subscription/OAuth path, never direct API-key billing.
+
+### Standard (default)
+No explicit model flag. The claude CLI picks its current default model.
+
+```bash
+nohup python3 {baseDir}/run-task.py \
+  --task "$(cat /tmp/prompt.txt)" \
+  --project ~/projects/x \
+  --session "agent:main:main:thread:<THREAD_ID>" \
+  > /tmp/cc-run.log 2>&1 &
+```
+
+### Fast (`--fast`)
+Requests true Claude Code Fast mode through the subscription/OAuth path.
+
+⚠️ Cost guard: Fast mode can cost about **$30 per 10 minutes of continuous work**. Use it **ONLY when the user explicitly asks for `--fast`, "Fast mode", or "быстрый режим".** Do not infer it from task importance, urgency/"срочно", long duration, or your own desire to finish sooner. Default to standard mode for every Claude Code launch unless Fast mode is explicitly requested.
+
+Implementation detail: when the installed Claude CLI exposes native `claude -p --fast`, the wrapper uses it. On local Claude Code 2.1.119, `--fast` is not a recognized pipe-mode flag yet, but `--settings '{"fastMode":true}' --model claude-opus-4-6` works when Claude Code uses the logged-in OAuth/subscription session. The wrapper strips `ANTHROPIC_API_KEY` automatically for both standard and fast runs.
+
+```bash
+nohup python3 {baseDir}/run-task.py \
+  --task "$(cat /tmp/prompt.txt)" \
+  --project ~/projects/x \
+  --session "agent:main:main:thread:<THREAD_ID>" \
+  --fast \
+  > /tmp/cc-run.log 2>&1 &
+```
+
+The wrapper does not map fast mode to `--effort low`. That is a different mechanism. If Fast mode is unavailable in the current auth/environment, Claude reports it through the run result or stderr.
+
+### Mode in notifications
+- Launch and completion notifications always include `Mode: standard` or `Mode: fast`.
+- Launch/startup output includes `Auth: subscription/OAuth (ANTHROPIC_API_KEY stripped)`.
+- `Model: <name>` is appended on completion only when Claude reports a resolved model via the stream-json `init`/`result` event. The wrapper never claims a model it didn't pass.
+
+### Completion Notifications — Estimated Cost
+Completion notifications include an estimated cost summary:
+- `Est. cost: subscription` — standard Claude Code task path; API-key billing is stripped from the child env
+- `Est. cost: ~$X.XXXX est.` — Fast mode or another explicitly token-billed path returned `total_cost_usd`; Fast mode spends extra usage even though auth is subscription/OAuth
+- `Est. cost: fast extra usage (cost unavailable)` — Fast mode ran but Claude did not return a dollar estimate
+- `in:NNK out:NNK` — input/output token counts
+- `cache↩:NNK` — cache-read tokens (if any)
+- `cache↑:NNK` — cache-creation tokens (if any)
+- `turns:N` — number of conversation turns
+
+Dollar figures are estimates from Claude's own output, not invoiced amounts.
+
 ## Claude Code Flags
 
 - `-p "task"` — print mode (non-interactive, outputs result)
 - `--dangerously-skip-permissions` — no confirmation prompts
 - `--verbose --output-format stream-json` — real-time activity tracking for heartbeats
+- Fast mode — requested only when the wrapper is invoked with `--fast`; use native `claude -p --fast` when supported, otherwise use `fastMode:true` settings under OAuth/subscription auth
 
 ### Why NOT exec/pty?
 - `exec` has 2 min default timeout → kills long tasks
@@ -441,6 +494,8 @@ Recommended wording to include in prompt:
 - "Send a progress update when you start"
 - "Send another update after major milestone(s)"
 - "If task exceeds 60 seconds, send at least one heartbeat-style update"
+
+The wrapper also injects a mandatory wait-notice rule into every task with a notify script: before Claude starts any deliberate wait/sleep/backoff/rate-limit pause longer than 60 seconds, it must send a progress notification saying how long it is about to wait and why, then send another notification when the wait is over. This prevents long rate-limit sleeps from looking like a hung run.
 
 For Telegram and WhatsApp runs, updates should use the injected automation script (`/tmp/cc-notify-<pid>.py`).
 
@@ -575,6 +630,7 @@ nohup python3 {baseDir}/run-task.py \
 - Claude Code runs on Max subscription ($200/mo) — NOT API tokens
 - Zero OpenClaw API cost while Claude Code works
 - Only cost: message delivery + brief agent turn for summary
+- Completion notifications show `Est. cost: subscription` for standard stripped-env Claude Code tasks; Fast mode shows dollar estimates from `total_cost_usd` because it consumes paid extra usage.
 
 ## Session Resumption
 
@@ -731,10 +787,14 @@ Includes a **Quick Triage Checklist (60 seconds)** plus detailed items: agent no
 double messages, wrong thread routing, UUID resolution failures, session-locked wake,
 `❌ Invalid routing`, Telegram HTTP 400 silent drops, mid-task update failures, stale/duplicate wake skips, and more.
 
-## Current Stable Behavior (2026-03-03)
+## Current Stable Behavior (2026-04-24)
 
 This is the version validated in live Telegram thread tests.
 
+- **Two execution modes only:** `standard` (no model flag, claude picks its default model) and `fast` (true Fast mode via native `--fast` when available, otherwise `fastMode:true` settings under OAuth/subscription auth).
+- **Billing guard:** every Claude Code child process is launched with `ANTHROPIC_API_KEY` stripped. The wrapper must not accidentally burn API credits.
+- **Mode in notifications:** launch and completion notifications always show `Mode: standard` or `Mode: fast`. The model name is appended on completion only when Claude reports it via the `init`/`result` stream-json event — the wrapper never claims a pinned model it didn't pass.
+- **Estimated cost in completion notifications:** standard stripped-env Claude Code task runs show `Est. cost: subscription`; Fast mode shows dollar estimates from `total_cost_usd` because it consumes paid extra usage.
 - Wake continuity: Telegram wake is delivered (`openclaw agent --deliver`) so continuation turns are visible in chat.
 - No silent launch policy: agent must post a visible decision turn before launching next iteration.
 - Deterministic wake guard: duplicate/stale wake dispatch is skipped by per-project state + `wake_id`/output dedupe.
