@@ -5,7 +5,7 @@ description: "Run Codex CLI, Claude Code, or another supported external agent as
 
 # Worker Relay
 
-Worker Relay is OpenClaw's external-agent execution harness. It runs Claude Code or Codex CLI as an asynchronous worker while the current OpenClaw agent remains the supervisor and delivery owner. The canonical executable is `{baseDir}/run-task.py`; do not create another runner or copy it into an automation. The historical name `claude-code-task` may remain in upgraded deployments only as a compatibility alias, never as a second implementation.
+Worker Relay is OpenClaw's external-agent execution harness. It runs Claude Code or Codex CLI as an asynchronous worker while the current OpenClaw agent remains the supervisor and delivery owner. The canonical Python entrypoint is `{baseDir}/run-task.py`, invoked as `python3 {baseDir}/run-task.py`; it does not need an executable bit. Do not create another runner or copy it into an automation. The historical name `claude-code-task` may remain in upgraded deployments only as a compatibility alias, never as a second implementation.
 
 Use these terms consistently: OpenClaw is the **supervisor**, Claude Code/Codex are **external workers**, and Worker Relay is the harness connecting dispatch, progress, delivery, wake, and continuation. A native OpenClaw subagent and a raw interactive CLI invocation are different execution surfaces.
 
@@ -13,11 +13,13 @@ Use these terms consistently: OpenClaw is the **supervisor**, Claude Code/Codex 
 
 Any explicit request to call, run, invoke, use, ask, or delegate to Claude Code or Codex triggers Worker Relay, even when the underlying task is small or could be answered inline. Do not replace that request with a native OpenClaw subagent or raw CLI. Direct CLI is allowed only when the user explicitly asks to bypass Worker Relay and run the provider interactively.
 
+Provider and fallback selection are literal. A request for Codex means Codex only; a request for Claude means Claude only. Do not add `--fallback-engine` because fallback exists, because an automation uses it, or because the user asks what fallback was selected. Fallback is `none` unless the user or owning automation explicitly requests cross-provider continuity.
+
 ## Non-negotiable operating rules
 
 These rules apply on the first read, including during a live E2E:
 
-1. Launch only `{baseDir}/run-task.py --detach`. The runner owns the transient user service needed to survive OpenClaw tool exit. Do not handwrite `nohup`, `systemd-run`, `tmux`, raw `claude`/`codex`, or another wrapper unless the user is explicitly testing that alternate surface.
+1. Launch only `python3 {baseDir}/run-task.py --detach`. The runner owns the transient user service needed to survive OpenClaw tool exit. Do not probe it with `test -x`: it is a Python entrypoint and may intentionally lack an executable bit. Do not handwrite `nohup`, `systemd-run`, `tmux`, raw `claude`/`codex`, or another wrapper unless the user is explicitly testing that alternate surface.
 2. Never edit the canonical shared-skill checkout during an E2E. Capture evidence, finish or stop the test, change the repository through its normal review/test/deploy workflow, then rerun from a clean deployed commit.
 3. Run provider/mode probes sequentially. Claude Code and Codex share local login, rollout, and registry state; parallel probes can invalidate the diagnosis.
 4. One `401`, transport error, `no rollout found`, timeout, or delayed wake is an observation, not a durable feature gap. Wait for the previous process to exit, run a standard control, retry the same case sequentially, and compare persisted state before changing current-state documentation.
@@ -45,7 +47,6 @@ Before every launch:
 python3 {baseDir}/run-task.py \
   --task "routing probe" \
   --engine codex \
-  --fallback-engine claude \
   --project /absolute/project/path \
   --session "$OPENCLAW_SESSION_KEY" \
   --validate-only
@@ -66,7 +67,6 @@ python3 {baseDir}/run-task.py \
   --detach-log /tmp/cc-launch.log \
   --task "$(cat "$PROMPT_FILE")" \
   --engine codex \
-  --fallback-engine claude \
   --project /absolute/project/path \
   --session "$OPENCLAW_SESSION_KEY" \
   --timeout 7200 \
@@ -74,6 +74,8 @@ python3 {baseDir}/run-task.py \
 ```
 
 Do not claim the task launched unless the launcher returns `DETACHED_LAUNCH_ACCEPTED` with a unit and log path. That is the last work result permitted in the current turn. Do not append shell `&`, inspect the service, poll the log, or keep any tool open with `wait`; `--detach` owns durability. End the current turn immediately, either normally or with one terminal `sessions_yield` call when that runtime requires it. The next turn begins from the routed completion wake: inspect terminal evidence and, when the multi-phase goal remains active, launch exactly the next phase before ending that wake turn. A text-only promise to continue later does not preserve execution.
+
+The default examples above intentionally have no fallback. Only when the user or owning automation explicitly requests cross-provider availability may the same validated and detached commands add `--fallback-engine claude` (or the opposite provider).
 
 ### Resume
 

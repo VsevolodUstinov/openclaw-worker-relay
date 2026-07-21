@@ -29,7 +29,7 @@ class InstructionContractTests(unittest.TestCase):
 
         required_phrases = (
             "Non-negotiable operating rules",
-            "Launch only `{baseDir}/run-task.py --detach`",
+            "Launch only `python3 {baseDir}/run-task.py --detach`",
             "Do not handwrite `nohup`, `systemd-run`",
             "Never edit the canonical shared-skill checkout during an E2E",
             "Run provider/mode probes sequentially",
@@ -50,6 +50,20 @@ class InstructionContractTests(unittest.TestCase):
         for phrase in required_phrases:
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, first_read)
+
+    def test_default_examples_do_not_enable_fallback(self):
+        skill = (SKILL_DIR / "SKILL.md").read_text()
+        preflight_example = skill.split("```bash", 1)[1].split("```", 1)[0]
+        launch_example = skill.split("## Launch", 1)[1].split("```bash", 1)[1].split("```", 1)[0]
+
+        self.assertNotIn("--fallback-engine", preflight_example)
+        self.assertNotIn("--fallback-engine", launch_example)
+        self.assertIn("Fallback is `none` unless", skill)
+
+    def test_python_entrypoint_does_not_require_executable_probe(self):
+        skill = (SKILL_DIR / "SKILL.md").read_text()
+        self.assertIn("invoked as `python3 {baseDir}/run-task.py`", skill)
+        self.assertIn("Do not probe it with `test -x`", skill)
 
     def test_testing_protocol_requires_sequential_confirmation(self):
         protocol = (SKILL_DIR / "references/testing-protocol.md").read_text()
