@@ -1,817 +1,204 @@
 ---
-name: claude-code-task
-description: "Launch Claude Code async in background with automatic delivery to Telegram/WhatsApp. Use for coding, refactoring, codebase research, deep research, comprehensive investigations, multi-source reports, file generation, and complex multi-step automations. NOT for quick one-off questions or real-time interactive tasks. Includes strict thread-safe routing + E2E operator validation workflow."
+name: worker-relay
+description: "Run Codex CLI, Claude Code, or another supported external agent as a supervised asynchronous worker with strict OpenClaw routing, progress notifications, result delivery, session resume, optional provider fallback, and multi-turn supervisor ownership. Use when asked to delegate substantial coding, research, analysis, document generation, or automation work to Codex/Claude, run a background worker with chat updates, continue an external worker session, or notify the originating chat when done. Do not use for native OpenClaw subagents, direct interactive CLI sessions, or quick conversational answers."
 ---
 
-# Claude Code Task (Async)
+# Worker Relay
 
-Run Claude Code in background — zero OpenClaw tokens while it works. Results delivered to WhatsApp or Telegram automatically.
+Worker Relay is OpenClaw's external-agent execution harness. It runs Claude Code or Codex CLI as an asynchronous worker while the current OpenClaw agent remains the supervisor and delivery owner. The canonical executable is `{baseDir}/run-task.py`; do not create another runner or copy it into an automation. The historical name `claude-code-task` may remain in upgraded deployments only as a compatibility alias, never as a second implementation.
 
-## Important: Claude Code = General AI Agent
+Use these terms consistently: OpenClaw is the **supervisor**, Claude Code/Codex are **external workers**, and Worker Relay is the harness connecting dispatch, progress, delivery, wake, and continuation. A native OpenClaw subagent and a raw interactive CLI invocation are different execution surfaces.
 
-Claude Code is NOT just a coding tool. It's a full-powered AI agent with web search, file access, and deep reasoning. Use it for ANY complex task:
+## Non-negotiable operating rules
 
-- **Research** — web search, synthesis, competitive analysis, user experience reports, deep research, evidence gathering, tradeoff studies, sanctions/KYC/AML investigations
-- **Coding** — create tools, scripts, APIs, refactor codebases
-- **Analysis** — read and analyze files, data, logs, source code
-- **Content** — write docs, presentations, reports, summaries
-- **Automations** — complex multi-step workflows with file system access
+These rules apply on the first read, including during a live E2E:
 
-Give it prompts the same way you'd talk to a smart human — natural language, focused on WHAT you need, not HOW to do it.
+1. Launch only `{baseDir}/run-task.py --detach`. The runner owns the transient user service needed to survive OpenClaw tool exit. Do not handwrite `nohup`, `systemd-run`, `tmux`, raw `claude`/`codex`, or another wrapper unless the user is explicitly testing that alternate surface.
+2. Never edit the canonical shared-skill checkout during an E2E. Capture evidence, finish or stop the test, change the repository through its normal review/test/deploy workflow, then rerun from a clean deployed commit.
+3. Run provider/mode probes sequentially. Claude Code and Codex share local login, rollout, and registry state; parallel probes can invalidate the diagnosis.
+4. One `401`, transport error, `no rollout found`, timeout, or delayed wake is an observation, not a durable feature gap. Wait for the previous process to exit, run a standard control, retry the same case sequentially, and compare persisted state before changing current-state documentation.
+5. Resume only after the fresh runner process has fully exited and its provider id is present in the registry. A resume failure still maps to exit `42` for callers, but the E2E diagnosis requires the control/retry sequence above.
+6. Correlate asynchronous messages by engine, output path, run id, and wake id. A late wake from an older run must not trigger a new diagnosis or an extra continuation.
+7. For a full live test, follow `references/testing-protocol.md` exactly. The test owns its ordered phases; do not improvise additional probes or launch phases in parallel.
+8. One detached worker phase occupies one supervisor turn. After `DETACHED_LAUNCH_ACCEPTED`, make no more work/tool calls in that turn: no `while`, `sleep`, `wait`, `systemctl`, log polling, registry inspection, or next launch. End the turn and continue only when the routed completion wake starts the next turn. If the runtime exposes `sessions_yield`, it is the sole optional exception and must immediately terminate the turn; do nothing after it. Polling after detach is an E2E failure because it masks the wake and tool-exit lifecycle being tested.
+9. A completion-wake turn is the next working supervisor turn, not a status-only intermission. After verifying the completed phase, if the ordered workflow still has work and no genuine blocker, launch exactly the next detached phase in that same wake turn and release it again. Never end a wake turn with only a promise such as "I will read the skill and launch the next phase"; no future trigger exists, so that is a stalled workflow and a failed E2E attempt.
+10. Detached services use `systemd-run --collect`. After collection, `systemctl show` may return default-looking `Result=success` and `ExecMainStatus=0` for a nonexistent unit; if `LoadState=not-found`, those fields are not exit evidence. Determine terminal status from the correlated runner wake/output and, when needed, the unit journal line `Main process exited ... status=N`. For invalid resume, `RESUME_FAILED` plus correlated `exit=42` or journal `status=42` passes; never override it with post-collection defaults.
 
-**NOT for:**
-- Quick questions (just answer directly)
-- Tasks needing real-time interaction
+## Mandatory preflight
 
-## Quick Start
+Before every launch:
 
-## What "run tests" means for this skill (critical)
-
-When user asks things like:
-- "прогони все тесты"
-- "run tests"
-- "проверь что всё работает"
-
-it means **run the full E2E operator validation flow** for `run-task.py` routing + notifications.
-
-It does **NOT** mean `pytest`/`unittest` discovery by default.
-
-Required behavior:
-1. Run routing validation first (`--validate-only`).
-2. Launch smoke/E2E scenario via `nohup` and file-based prompt.
-3. Wait for completion through normal async flow (wake/event), not same-turn blocking.
-4. Report PASS/FAIL against E2E criteria (routing, heartbeat, mid-task update, completion delivery).
-
-Use the canonical protocol: **[references/testing-protocol.md](references/testing-protocol.md)** and the section below **Full E2E Test (reference)**.
-
-## Async Boundary Rule (mandatory)
-
-`run-task.py` is asynchronous orchestration.
-
-After a successful `nohup` launch, the correct behavior is:
-1. Send a short launch acknowledgment (PID/log/session + a brief human-written summary of what you asked Claude to do), then
-2. **Stop this turn immediately**.
-3. Continue only when wake/completion event arrives in the same session.
-
-Do **not** keep waiting in the same turn for Claude Code completion.
-Do **not** poll and then summarize in the same turn unless user explicitly asked for active live monitoring.
-
-Anti-pattern:
-- ❌ Launch `run-task.py` and keep responding as if completion should appear in this turn.
-
-Correct pattern:
-- ✅ Launch `run-task.py` → acknowledge launch → stop → wait for wake.
-
-## Launch Confirmation Gate (mandatory)
-
-Never claim "launched" until you have **positive launch proof**.
-
-Required proof checklist (all):
-1. `nohup` command returned a PID,
-2. process is alive (`ps -p <PID>`),
-3. run log contains `🔧 Starting Claude Code...` (or equivalent startup marker),
-4. routing was validated (`--validate-only`) for Telegram thread runs.
-
-If launch fails with `❌ Invalid routing`:
-- resolve via `sessions_list`,
-- rerun with explicit `--notify-channel telegram --notify-thread-id <id> --notify-session-id <uuid>`,
-- re-check proof checklist,
-- only then send launch acknowledgment.
-
-Do not send "Claude Code ушёл в работу" before this gate is satisfied.
-
-Important: in your own launch acknowledgment, do **not** restate the full raw prompt.
-- Give only a short human summary of the task.
-- The run-task launch notification already includes the full prompt/body when needed.
-- Avoid duplicating large prompt text in the visible agent reply.
-
-## Pre-launch planning note (mandatory)
-
-Before launching Claude Code, post a short plan in chat:
-- how you plan to solve the task,
-- what result you expect from this run,
-- any clarifying questions/assumptions,
-- whether you expect a single-pass result or a staged multi-step approach.
-
-If staged: explicitly say this run is "phase 1" and what signal will decide phase 2.
-
-## Telegram Thread Safety (must-follow)
-
-For Telegram thread runs, `run-task.py` is designed to either route correctly or fail immediately.
-
-### Mandatory step before launch
-Resolve the **current runtime session key** first (source of truth), then launch with it.
-
-- Get current key via `sessions_list` (or existing runtime context)
-- If key is `agent:main:main:thread:<THREAD_ID>` → use it directly in `--session`
-- Never derive `--session` from `chat_id`/sender id heuristics
-
-### Rules
-- Use only `--session "agent:main:main:thread:<THREAD_ID>"` for thread tasks
-- Never use `agent:main:telegram:user:<id>` for thread tasks
-- If routing metadata is inconsistent (thread/session UUID/target mismatch), script exits with `❌ Invalid routing`
-- Default mode is `--telegram-routing-mode auto`:
-  - allows non-thread Telegram for setups without thread sessions
-  - blocks ambiguous user-scope session key (`agent:main:telegram:user:<id>`) unless explicitly forced
-  - blocks non-thread launch if a recent thread session exists for same target (likely misroute)
-- Force strict thread-only behavior with `--telegram-routing-mode thread-only`
-- Force non-thread behavior with `--telegram-routing-mode allow-non-thread` or `--allow-main-telegram`
-
-This is intentional: **abort fast > silent misroute**.
-
-⚠️ For background `claude-code-task` launches, **do not set `exec.timeout`**; use only `run-task.py --timeout`, otherwise OpenClaw may SIGTERM the whole process group early.
-
-⚠️ **NEVER put the task text directly in the shell command** — quotes, special characters, and newlines WILL break argument parsing. Always save the prompt to a file first, then use `$(cat file)`.
-
-### WhatsApp
+1. Preserve the exact source OpenClaw session key. Never synthesize `agent:main`; use the actual agent id and live session.
+2. Choose the real project directory. The runner does not create a Git repository inside it.
+3. Omission of `--engine` means Codex only, using the saved ChatGPT subscription login. Select Claude explicitly with `--engine claude`; never infer or add a fallback.
+4. Omission of `--mode` means Terra for Codex and Sonnet for Claude. Use `--mode sol` only with Codex or `--mode fable` only with Claude; never infer either premium mode.
+5. Add `--fallback-engine claude` only when the caller explicitly requires continuity across provider unavailability. Fallback is only for provider unavailability before useful work; it is not a generic retry.
+6. Decide whether this is a fresh workstream or a continuation. Use `--resume` only with a session/thread id created by the same engine, never a runner `run_id` or `wake_id`. Resume and provider fallback are intentionally mutually exclusive.
+7. Write a task with a concrete Definition of Done and an appropriate self-check.
+8. For routed runs, execute `--validate-only` first with the same engine, mode, and fallback flags. A routing failure is a launch blocker.
 
 ```bash
-# Step 1: Save prompt to a temp file
-write /tmp/cc-prompt.txt with your task text
-
-# Step 2: Launch with $(cat ...)
-nohup python3 {baseDir}/run-task.py \
-  --task "$(cat /tmp/cc-prompt.txt)" \
-  --project ~/projects/my-project \
-  --session "agent:main:whatsapp:group:<JID>" \
-  --timeout 900 \
-  > /tmp/cc-run.log 2>&1 &
+python3 {baseDir}/run-task.py \
+  --task "routing probe" \
+  --engine codex \
+  --fallback-engine claude \
+  --project /absolute/project/path \
+  --session "$OPENCLAW_SESSION_KEY" \
+  --validate-only
 ```
 
-The `--session` key (e.g. `agent:main:whatsapp:group:120363425246977860@g.us`) is used to auto-detect the WhatsApp target.
+WhatsApp validation requires the exact session to exist in OpenClaw's gateway or local session registry. Telegram topics additionally require a resolvable target and session UUID. Never bypass validation by manually inventing a destination.
 
-### Telegram (thread-safe default)
+## Launch
+
+Put substantial prompts in a file to avoid shell quoting and truncation problems:
 
 ```bash
-# ALWAYS use the current thread session key from context:
-# agent:main:main:thread:<THREAD_ID>
-nohup python3 {baseDir}/run-task.py \
-  --task "$(cat /tmp/cc-prompt.txt)" \
-  --project ~/projects/my-project \
-  --session "agent:main:main:thread:<THREAD_ID>" \
-  --timeout 900 \
-  > /tmp/cc-run.log 2>&1 &
-```
-
-> Do **NOT** use `agent:main:telegram:user:<id>` for thread tests/runs.
-> That routes to main chat scope and can drift from the source thread.
-
-### Telegram Threaded Mode (1:1 DM with threads)
-
-When Marvin is used in Telegram Threaded Mode, each thread has its own session key like `agent:main:main:thread:369520`.
-
-**Fail-safe routing (NEW):** `run-task.py` now enforces strict thread routing.
-- If `--session` contains `:thread:<id>`, the script **refuses to start** unless Telegram target + thread session UUID are resolved.
-- It auto-resolves missing values from `sessions_list` when possible.
-- If the session is inactive and not returned by API, it falls back to local session files: `~/.openclaw/agents/main/sessions/*-topic-<thread_id>.jsonl`.
-- If provided `--notify-session-id` mismatches the session key, it exits with error.
-- Result: misrouted launches/heartbeats to main chat are blocked before Claude starts.
-
-Use `--notify-session-id` to wake the exact thread session:
-
-```bash
-nohup python3 {baseDir}/run-task.py \
-  --task "$(cat /tmp/cc-prompt.txt)" \
-  --project ~/projects/my-project \
-  --session "agent:main:main:thread:369520" \
-  --timeout 900 \
-  > /tmp/cc-run.log 2>&1 &
-```
-
-All 5 notification types route to the DM thread when `--session` key contains `:thread:<id>` ✅
-
-- `--notify-session-id` — optional override. Usually auto-resolved from session metadata/files.
-- `--notify-thread-id` — optional override. Usually auto-extracted from `--session`.
-- `--reply-to-message-id` — optional debug field; avoid for DM thread routing.
-- `--validate-only` — resolve routing and exit (no Claude run). Use this to verify thread launch args safely.
-
-- `--notify-channel` — optional channel hint (`telegram`/`whatsapp`); target is always auto-resolved from session metadata
-- `--timeout` — max runtime in seconds (default: 7200 = 2 hours)
-- built-in smart stall observer (shadow mode): sends "would terminate" warnings on likely hangs
-- built-in post-result tail-hang detector (short grace after result event)
-- `--trace-live` — emit live technical trace markers into the same chat/thread (debug mode)
-- Always redirect stdout/stderr to a log file
-
-### Why file-based prompts?
-Research/complex prompts contain single quotes, double quotes, markdown, backticks — any of these break shell argument parsing. Saving to a file and reading with `$(cat ...)` avoids all quoting issues.
-
-## Channel Detection
-
-The `detect_channel()` function determines where to send notifications:
-
-1. **Deterministic auto-resolve** — target is resolved from session metadata/session key (no manual target flag)
-2. **WhatsApp auto-detect** — if the session key contains `@g.us` (WhatsApp group JID), WhatsApp is used
-3. **Fail fast on unresolved Telegram target** — script exits with `❌ Invalid routing` instead of silent misroute
-
-```python
-def detect_channel(session_key):
-    if NOTIFY_CHANNEL_OVERRIDE and NOTIFY_TARGET_OVERRIDE:
-        return NOTIFY_CHANNEL_OVERRIDE, NOTIFY_TARGET_OVERRIDE
-    jid = extract_group_jid(session_key)
-    if jid:
-        return "whatsapp", jid
-    return None, None
-```
-
-## How It Works
-
-```
-┌─────────────┐     nohup      ┌──────────────┐
-│    Agent     │ ──────────────▶│  run-task.py  │
-│  (OpenClaw)  │                │  (detached)   │
-└─────────────┘                └──────┬───────┘
-                                      │
-                                      ▼
-                               ┌──────────────┐
-                               │  Claude Code  │  ← runs on Max subscription ($0 API)
-                               │  (-p mode)    │
-                               └──────┬───────┘
-                                      │
-                          ┌───────────┼───────────┐
-                          ▼           ▼           ▼
-                    Every 60s    On complete   On error/timeout
-                    ┌────────┐  ┌──────────┐  ┌──────────────┐
-                    │ ⏳ ping │  │ ✅ result │  │ ❌/⏰/💥 error│
-                    │ silent │  │ channel  │  │   channel    │
-                    └────────┘  └──────────┘  └──────────────┘
-```
-
-### WhatsApp notification flow:
-1. **Heartbeat pings** (every 60s) → WhatsApp direct (informational, no agent wake)
-2. **Final result** → WhatsApp direct (human sees immediately) + `sessions_send` (agent wakes up)
-3. **Agent receives** completion payload via sessions_send → processes it → sends summary via `message(send)` to WhatsApp group
-4. Human sees both: raw result + agent's analysis/next steps
-
-### Wake continuation behavior
-Wake payload frames continuation as the **same ongoing assistant conversation** (same agent identity, same session, same history) after Claude Code replies to the previous launch.
-
-Continuation flow:
-- react briefly to Claude result
-- evaluate goal completion (gap analysis)
-- if gaps remain and there is no real blocker requiring user input or external waiting: explain the next fix, then launch the next Claude run in the same turn
-- keep repeating this wake → visible decision → relaunch pattern for as many iterations as needed until the original goal is complete or a genuine blocker is hit
-- if complete: report final outcome and stop
-
-### Deterministic wake guard (anti-duplicate)
-- Each run now carries `run_id` and `wake_id` in wake payload.
-- `run-task.py` keeps per-project state in `/tmp/cc-orchestrator-state-<hash>.json`.
-- Duplicate/stale wake dispatches (same output or same wake_id) are skipped before wake delivery.
-- In debug mode (`--trace-live`), skipped wakes are announced as `[TRACE][TECH][TELEGRAM][WAKE][SKIP]`.
-
-### No silent launch policy (always-on)
-- Silent launch is forbidden (not only in debug mode).
-- On wake, agent must first post a visible decision turn:
-  - `[TRACE][AGENT][WAKE_RECEIVED] ...`
-  - `[TRACE][AGENT][DECISION] continue|stop ...`
-- If the goal is still not complete and there is no real blocker, the next Claude iteration is mandatory.
-- Only after that visible decision may the next Claude iteration be launched.
-### Telegram notification flow (DM Threaded Mode — full pipeline):
-1. 🚀 **Launch notification** → thread ✅ (silent; HTML; `<blockquote expandable>` for prompt; via `send_telegram_direct`; includes `Resume: <session-id|new>`)
-2. ⏳ **Heartbeat** (every 60s) → thread ✅ (silent; plain text; via `send_telegram_direct`)
-3. 📡 **Claude Code mid-task updates** → thread ✅ (on-disk Python script `/tmp/cc-notify-{pid}.py`; CC calls file; prefix `"📡 🟢 CC: "` auto-added)
-4. ✅/❌/⏰/💥 **Result notification** → thread ✅ (HTML; `<blockquote expandable>` for result; via `send_telegram_direct`)
-5. 🤖 **Agent continuation reply** → delivered to chat via `openclaw agent --deliver` ✅ (same session continuation is visible to user)
-
-**`send_telegram_direct()`** is the core mechanism for all thread-targeted notifications from external scripts. It calls `api.telegram.org` directly with `message_thread_id` — bypasses the OpenClaw message tool entirely (which cannot route to DM threads from outside a session context).
-
-**Fallback** — if agent wake fails (session locked/busy): `already_sent=True` is set after the direct send, so no duplicate is sent.
-
-### Key detail: Telegram vs WhatsApp delivery
-
-**WhatsApp:** Raw result sent directly (human sees it immediately) + `sessions_send` wakes agent for analysis.
-
-**Telegram:** Result sent via `send_telegram_direct` → then agent is woken via `openclaw agent --session-id --deliver` so the continuation turn is visible in chat by default. This is the intended “same agent, same conversation” behavior after Claude completion.
-
-**Why not `sessions_send` for Telegram?** `sessions_send` is blocked in the HTTP `/tools/invoke` deny list by architectural design. The `openclaw agent` CLI bypasses this limitation.
-
-## Reliability Features
-
-### Timeout / stall protection
-- `--timeout 7200` → hard max runtime (SIGTERM → wait 10s → SIGKILL)
-- built-in smart stall observer (shadow mode): warns when run looks kill-worthy but does not terminate
-- built-in post-result tail-hang detector: warns when process stays alive after result event grace
-- Timeout/stall notification sent to channel with tool call count and last activity
-- Partial output saved to file
-
-### Crash safety
-- `try/except` wraps entire main → crash notification always sent
-- Both channel notification and agent wake attempted on any failure
-
-### PID tracking
-- PID file written to `skills/claude-code-task/pids/`
-- Stale PIDs cleaned on startup
-- Can check running tasks: `ls skills/claude-code-task/pids/`
-
-### Silent mode (Telegram only)
-Telegram supports silent notifications (no sound).
-
-Current policy: **all Claude Code notifications are silent** in Telegram:
-- Heartbeat pings → `silent=True`
-- Launch notifications → `silent=True`
-- Mid-task updates (`📡 🟢 CC`) → `silent=True`
-- Final results → `silent=True`
-- Wake-summary instruction requests `silent=True`
-
-WhatsApp does NOT support silent mode — the flag is ignored for WhatsApp.
-
-### Telegram DM Threads vs Forum Groups
-
-Telegram has two distinct thread models. The key difference for run-task.py is how to route messages to the thread.
-
-**The core problem with external scripts:**
-- The OpenClaw `message` tool's `threadId` parameter is **Discord-specific** — ignored for Telegram
-- Target format `"chatId:topic:threadId"` is rejected by the message tool's target resolver
-- Session auto-routing (`currentThreadTs`) works ONLY inside active sessions — external scripts have no session context
-- **Solution:** `send_telegram_direct()` bypasses the message tool entirely; calls `api.telegram.org` directly with `message_thread_id`
-
-**DM Threaded Mode** (bot-user private chat with threads):
-- All notifications use `send_telegram_direct(chat_id, text, thread_id=..., parse_mode=...)` ✅
-- `thread_id` auto-extracted from session key `*:thread:<id>` by `extract_thread_id()`
-- Launch + finish: `parse_mode="HTML"` with `<blockquote expandable>` for prompt/result
-- Heartbeats + mid-task: `parse_mode=None` (plain text, avoid Markdown parse errors)
-- **`parse_mode="Markdown"` trap**: finish messages contain `**text**` (CommonMark bold); Telegram MarkdownV1 rejects this with HTTP 400 — messages silently don't arrive
-- **`replyTo` trap**: combining `replyTo` + `message_thread_id` → Telegram rejects request → fallback strips thread_id → message lands in main chat
-- Agent continuation reply: `openclaw agent --session-id <uuid> --deliver` publishes the wake turn to chat so the user sees the same ongoing assistant conversation.
-
-**Forum Groups** (supergroup with Forum topics enabled):
-- Same `send_telegram_direct()` approach works; `message_thread_id` is standard Bot API for Forum topics
-- Auto-detected from session key pattern `*:thread:<id>`
-
-**Claude Code mid-task updates:**
-- DO NOT embed bot tokens or curl commands in the task prompt — Claude Code flags this as prompt injection
-- run-task.py writes `/tmp/cc-notify-{pid}.py` to disk before launching Claude Code
-- Task prompt prepended with `[Automation context: ... python3 /tmp/cc-notify-{pid}.py 'msg' ...]`
-- Claude Code calls the file (legitimate local script pattern, no safety warning)
-- Script automatically prepends `"📡 🟢 CC: "` to all messages; cleaned up in `finally` block
-- The same local script interface is now used for both Telegram and WhatsApp; transport differences stay inside the generated script
-
-### Notification types
-
-| Event | Emoji | WhatsApp delivery | Telegram delivery | DM thread? |
-|-------|-------|-------------------|-------------------|------------|
-| Launch | 🚀 | send_channel (Markdown) | send_telegram_direct (HTML, silent) | ✅ message_thread_id |
-| Heartbeat | ⏳ | send_channel (Markdown) | send_telegram_direct (plain, silent) | ✅ message_thread_id |
-| CC mid-task update | 📡 | — | /tmp/cc-notify-{pid}.py (Bot API, silent) | ✅ message_thread_id |
-| Success | ✅ | send_channel + sessions_send | send_telegram_direct (HTML) + openclaw agent | ✅ message_thread_id |
-| Error | ❌ | send_channel + sessions_send | send_telegram_direct (HTML) + openclaw agent | ✅ message_thread_id |
-| Timeout | ⏰ | send_channel + sessions_send | send_telegram_direct (HTML) + openclaw agent | ✅ message_thread_id |
-| Crash | 💥 | send_channel + sessions_send | send_telegram_direct (HTML) + openclaw agent | ✅ message_thread_id |
-| Agent continuation reply | 🤖 | — | openclaw agent wake (`--deliver`) | ✅ visible in chat |
-
-## Execution Modes
-
-The wrapper exposes exactly two execution modes. No advisory flags.
-
-Hard billing invariant: `run-task.py` always strips `ANTHROPIC_API_KEY` from the Claude Code child process environment. Claude Code task runs must use the logged-in subscription/OAuth path, never direct API-key billing.
-
-### Standard (default)
-No explicit model flag. The claude CLI picks its current default model.
-
-```bash
-nohup python3 {baseDir}/run-task.py \
-  --task "$(cat /tmp/prompt.txt)" \
-  --project ~/projects/x \
-  --session "agent:main:main:thread:<THREAD_ID>" \
-  > /tmp/cc-run.log 2>&1 &
-```
-
-### Fast (`--fast`)
-Requests true Claude Code Fast mode through the subscription/OAuth path.
-
-⚠️ Cost guard: Fast mode can cost about **$30 per 10 minutes of continuous work**. Use it **ONLY when the user explicitly asks for `--fast`, "Fast mode", or "быстрый режим".** Do not infer it from task importance, urgency/"срочно", long duration, or your own desire to finish sooner. Default to standard mode for every Claude Code launch unless Fast mode is explicitly requested.
-
-Implementation detail: when the installed Claude CLI exposes native `claude -p --fast`, the wrapper uses it. On local Claude Code 2.1.119, `--fast` is not a recognized pipe-mode flag yet, but `--settings '{"fastMode":true}' --model claude-opus-4-6` works when Claude Code uses the logged-in OAuth/subscription session. The wrapper strips `ANTHROPIC_API_KEY` automatically for both standard and fast runs.
-
-```bash
-nohup python3 {baseDir}/run-task.py \
-  --task "$(cat /tmp/prompt.txt)" \
-  --project ~/projects/x \
-  --session "agent:main:main:thread:<THREAD_ID>" \
-  --fast \
-  > /tmp/cc-run.log 2>&1 &
-```
-
-The wrapper does not map fast mode to `--effort low`. That is a different mechanism. If Fast mode is unavailable in the current auth/environment, Claude reports it through the run result or stderr.
-
-### Mode in notifications
-- Launch and completion notifications always include `Mode: standard` or `Mode: fast`.
-- Launch/startup output includes `Auth: subscription/OAuth (ANTHROPIC_API_KEY stripped)`.
-- `Model: <name>` is appended on completion only when Claude reports a resolved model via the stream-json `init`/`result` event. The wrapper never claims a model it didn't pass.
-
-### Completion Notifications — Estimated Cost
-Completion notifications include an estimated cost summary:
-- `Est. cost: subscription` — standard Claude Code task path; API-key billing is stripped from the child env
-- `Est. cost: ~$X.XXXX est.` — Fast mode or another explicitly token-billed path returned `total_cost_usd`; Fast mode spends extra usage even though auth is subscription/OAuth
-- `Est. cost: fast extra usage (cost unavailable)` — Fast mode ran but Claude did not return a dollar estimate
-- `in:NNK out:NNK` — input/output token counts
-- `cache↩:NNK` — cache-read tokens (if any)
-- `cache↑:NNK` — cache-creation tokens (if any)
-- `turns:N` — number of conversation turns
-
-Dollar figures are estimates from Claude's own output, not invoiced amounts.
-
-## Claude Code Flags
-
-- `-p "task"` — print mode (non-interactive, outputs result)
-- `--dangerously-skip-permissions` — no confirmation prompts
-- `--verbose --output-format stream-json` — real-time activity tracking for heartbeats
-- Fast mode — requested only when the wrapper is invoked with `--fast`; use native `claude -p --fast` when supported, otherwise use `fastMode:true` settings under OAuth/subscription auth
-
-### Why NOT exec/pty?
-- `exec` has 2 min default timeout → kills long tasks
-- Even with `pty:true`, output has escape codes, hard to parse
-- `nohup` + `-p` mode: clean, detached, reliable
-
-### Git requirement
-Claude Code needs a git repo. `run-task.py` auto-inits if missing.
-
-## Python/runtime compatibility
-
-`run-task.py` should stay runnable on plain system Python and must not rely on ambient third-party packages for core transport.
-
-Current compatibility rules:
-- use `Optional[X]` from `typing` (not `X | None`) so the script remains compatible with Python 3.9+
-- do not require `requests` for startup, routing validation, gateway tool calls, or Telegram Bot API calls
-- prefer stdlib transport for orchestration-critical paths so OpenClaw/runtime updates do not break the wrapper before launch
-
-```python
-# Correct (3.9+)
-from typing import Optional
-def foo(x: Optional[str]) -> Optional[str]: ...
-
-# Would break on 3.9
-def foo(x: str | None) -> str | None: ...
-```
-
-Practical lesson from 2026-04-14:
-- a runtime update left the wrapper running under Python 3.14 without `requests`
-- failure happened at import time (`ModuleNotFoundError`) before `--validate-only` could even test routing
-- system wrappers should fail on real orchestration problems, not on optional packaging drift
-
-## Full E2E Test (reference)
-
-Use this when you need to validate the **entire pipeline** in one run:
-- launch notification in source thread
-- heartbeat after >60s
-- Claude mid-task progress update (📡 🟢 CC)
-- final result in source thread
-- agent wake attempt with summary step
-
-### Pass criteria
-1. Launch message appears in the same thread (with expandable prompt quote)
-2. At least one wrapper heartbeat appears after ~60s
-3. At least one mid-task CC update appears (via `/tmp/cc-notify-<pid>.py`)
-4. Final result appears in the same thread (expandable result quote)
-5. Agent wake continuation is delivered (`openclaw agent --session-id ... --deliver`) and appears visibly in chat
-
-### Interactive test rule (time budget)
-For routine interactive testing, prefer keeping the continuation chain short when that still validates the behavior you care about.
-- Phase 1 may intentionally leave a visible gap
-- Follow-up iterations should close the gap efficiently
-- But the general production rule still applies: if the real goal is not complete and there is no blocker, continue relaunching until it is complete
-
-Reason: routine regression runs should stay reasonably fast, but production behavior should not stop early just because an intermediate iteration was incomplete.
-
-### Visibility rule (mandatory)
-Between `✅ Claude Code completed` and any next `🚀 Claude Code started`, there must be a user-facing analysis message in the thread.
-- The agent must first post: what was done, what gaps remain, and the decision to continue/stop.
-- Only after that message may it launch the next iteration.
-- No silent jump from completion directly to next start.
-
-### Canonical full test prompt pattern
-- keep prompt **compact** (about 10 lines) for routine testing
-- ensure prompt length is **>4500 chars** to verify quote truncation/collapse behavior in Telegram
-- force runtime >60s (`sleep 70`) to trigger wrapper heartbeat
-- explicitly instruct Claude to call the notify script at least twice
-- include a short structured report so output is easy to verify
-- the >4500-char filler can be useful work (not just junk): use it for any creative/output-generating task the agent genuinely wants to do in that moment, as long as it remains safe and relevant to the test context
-
-## Long-running task guidance
-
-If a Claude Code task is expected to run longer than ~1 minute, explicitly ask Claude to send intermediate progress updates during execution.
-
-Recommended wording to include in prompt:
-- "Send a progress update when you start"
-- "Send another update after major milestone(s)"
-- "If task exceeds 60 seconds, send at least one heartbeat-style update"
-
-The wrapper also injects a mandatory wait-notice rule into every task with a notify script: before Claude starts any deliberate wait/sleep/backoff/rate-limit pause longer than 60 seconds, it must send a progress notification saying how long it is about to wait and why, then send another notification when the wait is over. This prevents long rate-limit sleeps from looking like a hung run.
-
-For Telegram and WhatsApp runs, updates should use the injected automation script (`/tmp/cc-notify-<pid>.py`).
-
-### Canonical launch (minimal mode)
-```bash
-cat > /tmp/cc-full-test-prompt.txt << 'EOF'
-# ~10 lines, but total >4500 chars:
-# 1) notify script now
-# 2) create test file with repeated text (to exceed 4500 chars)
-# 3) sleep 70 + notify script again
-# 4) run several shell commands
-# 5) return short structured report
-EOF
+PROMPT_FILE=/tmp/cc-prompt-$(date +%s).txt
+# Write the complete task to $PROMPT_FILE with the environment's normal file tool.
 
 python3 {baseDir}/run-task.py \
-  --task "$(cat /tmp/cc-full-test-prompt.txt)" \
-  --project /tmp/cc-e2e-project \
-  --session "agent:main:main:thread:<THREAD_ID>" \
-  --validate-only
-
-nohup python3 {baseDir}/run-task.py \
-  --task "$(cat /tmp/cc-full-test-prompt.txt)" \
-  --project /tmp/cc-e2e-project \
-  --session "agent:main:main:thread:<THREAD_ID>" \
-  --timeout 900 \
-  > /tmp/cc-full-test.log 2>&1 &
+  --detach \
+  --detach-log /tmp/cc-launch.log \
+  --task "$(cat "$PROMPT_FILE")" \
+  --engine codex \
+  --fallback-engine claude \
+  --project /absolute/project/path \
+  --session "$OPENCLAW_SESSION_KEY" \
+  --timeout 7200 \
+  --session-label "short workstream label"
 ```
 
-### Verification artifacts
-- wrapper log: `/tmp/cc-full-test.log`
-- Claude output: `/tmp/cc-YYYYMMDD-HHMMSS.txt`
-- session registry entry in `~/.openclaw/claude_sessions.json`
+Do not claim the task launched unless the launcher returns `DETACHED_LAUNCH_ACCEPTED` with a unit and log path. That is the last work result permitted in the current turn. Do not append shell `&`, inspect the service, poll the log, or keep any tool open with `wait`; `--detach` owns durability. End the current turn immediately, either normally or with one terminal `sessions_yield` call when that runtime requires it. The next turn begins from the routed completion wake: inspect terminal evidence and, when the multi-phase goal remains active, launch exactly the next phase before ending that wake turn. A text-only promise to continue later does not preserve execution.
 
-## Examples
-
-### WhatsApp: Create a tool
-```bash
-nohup python3 {baseDir}/run-task.py \
-  -t "Create a Python CLI tool that converts markdown to HTML with syntax highlighting. Save as convert.py" \
-  -p ~/projects/md-converter \
-  -s "agent:main:whatsapp:group:120363425246977860@g.us" \
-  > /tmp/cc-run.log 2>&1 &
-```
-
-### Telegram: Research codebase (thread-safe)
-```bash
-nohup python3 {baseDir}/run-task.py \
-  --task "$(cat /tmp/cc-prompt.txt)" \
-  --project ~/projects/my-project \
-  --session "agent:main:main:thread:<THREAD_ID>" \
-  --timeout 1800 \
-  > /tmp/cc-run.log 2>&1 &
-```
-
-### Telegram Threaded Mode: Research codebase
-```bash
-nohup python3 {baseDir}/run-task.py \
-  --task "$(cat /tmp/cc-prompt.txt)" \
-  --project ~/projects/my-project \
-  --session "agent:main:main:thread:369520" \
-  --timeout 1800 \
-  > /tmp/cc-run.log 2>&1 &
-# thread_id auto-extracted from session key
-# target + session UUID auto-resolved from API/local session files
-```
-
-### Telegram Threaded Mode: Mid-task updates from Claude Code
-
-run-task.py automatically creates an on-disk notification script before launching Claude Code, so CC can send progress updates without seeing the bot token in the prompt (which triggers safety refusals):
+### Resume
 
 ```bash
-# Just write a normal task prompt — run-task.py handles the rest
-cat > /tmp/cc-prompt.txt << 'EOF'
-STEP 1: Write analysis to /tmp/report.txt (600+ words)...
-
-After step 1, send a progress notification using the script from the
-automation context above: python3 /tmp/cc-notify-<PID>.py "Step 1 done."
-
-STEP 2: Write summary to /tmp/summary.txt...
-EOF
-
-nohup python3 {baseDir}/run-task.py \
-  --task "$(cat /tmp/cc-prompt.txt)" \
-  --project ~/projects/my-project \
-  --session "agent:main:main:thread:<THREAD_ID>" \
-  --timeout 1800 \
-  > /tmp/cc-run.log 2>&1 &
-# run-task.py writes /tmp/cc-notify-{pid}.py before launch
-# Prepends "[Automation context: use python3 /tmp/cc-notify-{pid}.py 'msg']" to task
-# Claude Code calls the file; prefix "📡 🟢 CC: " auto-added; file cleaned up on exit
+python3 {baseDir}/run-task.py \
+  --detach \
+  --detach-log /tmp/cc-resume.log \
+  --task "Focused next step" \
+  --engine codex \
+  --project /absolute/project/path \
+  --session "$OPENCLAW_SESSION_KEY" \
+  --resume "$CODEX_THREAD_ID"
 ```
 
-> ⚠️ **Never embed bot tokens or curl commands in the task prompt** — Claude Code correctly identifies hardcoded tokens + external API calls as prompt injection and refuses. Use the on-disk script pattern above instead.
+Resume only when prior worker context is useful and the work is sequential. Never pass a Claude session id to Codex or a Codex thread id to Claude. Start fresh for unrelated work, intentional parallelism, or a missing/expired session. Exit `42` means the resume did not start; relaunch fresh when preserving that exact old session was not a user requirement.
 
-> **Quick reference: launching from a Telegram DM thread (minimal mode)**
-> ```bash
-> # 1) Validate routing first (no Claude run)
-> python3 {baseDir}/run-task.py \
->   --task "probe" \
->   --project ~/projects/x \
->   --session "agent:main:main:thread:<THREAD_ID>" \
->   --validate-only
->
-> # 2) Real launch (only 3 required params)
-> nohup python3 {baseDir}/run-task.py \
->   --task "$(cat /tmp/prompt.txt)" \
->   --project ~/projects/x \
->   --session "agent:main:main:thread:<THREAD_ID>" \
->   --timeout 900 \
->   > /tmp/cc-run.log 2>&1 &
-> ```
-> - Required: `--task`, `--project`, `--session`
-- Safety: Telegram launches without `:thread:<id>` are blocked by default (`❌ Unsafe routing blocked`)
-- For non-thread Telegram deployments, use `--telegram-routing-mode allow-non-thread`.
-> - `THREAD_ID` is auto-extracted from session key
-> - Target + session UUID are auto-resolved (API, then local session-file fallback)
-> - If routing is inconsistent/unresolved, script exits with `❌ Invalid routing` before run
-> - All notifications from run-task (launch/heartbeat/result) stay on the source thread ✅
+## Execution modes
 
-### Long task with extended timeout
-```bash
-nohup python3 {baseDir}/run-task.py \
-  -t "Refactor the entire auth module to use JWT tokens" \
-  -p ~/projects/backend \
-  -s "agent:main:whatsapp:group:120363425246977860@g.us" \
-  --timeout 3600 \
-  > /tmp/cc-run.log 2>&1 &
-```
-
-## Cost
-
-- Claude Code runs on Max subscription ($200/mo) — NOT API tokens
-- Zero OpenClaw API cost while Claude Code works
-- Only cost: message delivery + brief agent turn for summary
-- Completion notifications show `Est. cost: subscription` for standard stripped-env Claude Code tasks; Fast mode shows dollar estimates from `total_cost_usd` because it consumes paid extra usage.
-
-## Session Resumption
-
-Claude Code sessions can be resumed to continue previous conversations. This is useful for:
-- Follow-up tasks building on previous research
-- Continuing after timeouts or interruptions
-- Multi-step workflows where context matters
-
-### ⚠️ Resume ID — Critical Rule
-`--resume` takes the **Claude Code session ID**, not the `run_id` or `wake_id`.
-
-Correct source — look for this line in the run log:
-```
-📝 Session registered: <session-id-here>
-```
-That is the value to pass as `--resume <session-id>`.
-
-**Do NOT use:**
-- `run_id` from wake payload
-- `wake_id` from wake payload
-- session IDs from previous unrelated runs
-
-When in doubt: skip `--resume` and start fresh.
-
-### How to Resume
-
-When a task completes, the session ID is automatically captured and saved to the registry (`~/.openclaw/claude_sessions.json`).
-
-For resumed runs, keep the new prompt **short**. Prior Claude session history is already available through `--resume`; re-sending a long orchestration/continuity prompt can trigger `Prompt is too long` before useful work starts.
-
-To resume a session, use the `--resume` flag:
+- No engine/mode/model/Fast/fallback flags: Codex on explicit `gpt-5.6-terra`, with no fallback.
+- `--engine claude` without a mode/model/Fast flag: Claude on the forward-compatible `sonnet` alias, with no fallback.
+- `--mode sol`: explicit Codex-only premium mode, pinned to `gpt-5.6-sol`.
+- `--engine claude --mode fable`: explicit Claude-only premium mode, pinned to the forward-compatible `fable` alias.
+- `--fallback-engine NAME`: one sequential retry only when the primary executable is absent or the provider fails before useful work with recognized auth, rate-limit, network, or service-unavailable evidence. The failed primary does not emit a false final wake; the fallback owns final delivery.
+- `--model NAME`: expert provider-specific override on the selected subscription path.
+- `--fast`: the selected provider's native Fast mode. For Codex this sets `features.fast_mode=true` and `service_tier="fast"`; use only when the user explicitly requests Fast or urgent paid speed.
+- `--mode`, `--model`, and `--fast` are mutually exclusive.
+- Provider fallback cannot be combined with `--resume`, `--mode`, or provider-specific `--model`. It never triggers after a tool call, a completed result, an ordinary task failure, or a timeout, avoiding duplicate side effects.
 
 ```bash
-nohup python3 {baseDir}/run-task.py \
-  --task "$(cat /tmp/cc-prompt.txt)" \
-  --project ~/projects/my-project \
-  --session "SESSION_KEY" \
-  --resume <session-id> \
-  > /tmp/cc-run.log 2>&1 &
+# Explicit Sol
+python3 {baseDir}/run-task.py --mode sol --task "..." --project /absolute/path
+
+# Explicit Fable
+python3 {baseDir}/run-task.py --engine claude --mode fable --task "..." --project /absolute/path
 ```
 
-### Session Labels
+The runner strips `ANTHROPIC_API_KEY` for Claude and `OPENAI_API_KEY`, `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`, and inherited `CODEX_HOME` for Codex. This is a billing/auth invariant: workers use the user's saved Claude or `~/.codex` ChatGPT subscription identity, not API credentials or an OpenClaw agent-local Codex home.
 
-Use `--session-label` to give sessions human-readable names for easier tracking:
+## Delivery ownership
+
+The external coding agent is a worker, not the acceptance owner. The supervising agent must:
+
+1. Preserve the original user goal across wake turns and compaction.
+2. Ask the selected worker for the real result, not merely progress or an implementation proposal.
+3. Include self-verification in the worker prompt when applicable.
+4. Inspect the result and independently run the smallest meaningful verification.
+5. Launch a focused follow-up when the original goal remains incomplete and no genuine blocker exists.
+6. Report completion only after the original goal, not merely the latest substep, is satisfied.
+
+The runner sends launch/progress/result notifications and wakes the original supervising session. It must never wake a different agent merely because that key looks syntactically plausible.
+
+## Feature workflow
+
+This skill is the canonical feature-delivery workflow; do not fork its rules into another skill.
+
+Classify before launch:
+
+| Size | Typical scope | Design action |
+|---|---|---|
+| S | One file, known pattern, low blast radius | Implement directly |
+| M | Several files, integration or interface change | One pragmatic design in `DESIGN.md` |
+| L | New subsystem, broad or risky change | Compare 2-3 real options in `DESIGN.md` |
+
+User instructions override the gate: design-only stops after design; "just build it" skips design; explicit full-design requests use the L flow.
+
+For M/L work, have the selected worker read local instructions and relevant code first, document interfaces, migration/rollback, risks, and testable DoD, then self-review the design. Continue autonomously through implementation and verification unless user input is genuinely required.
+
+Use the detailed references only when the task needs them:
+
+- `references/feature-size-gate-guide.md`
+- `references/feature-design-template.md`
+- `references/feature-architect-prompts.md`
+- `references/feature-autonomous-iteration-model.md`
+
+## Prompt contract
+
+A strong worker task contains:
+
+- original intent and exact deliverable;
+- target repository and relevant paths;
+- local instructions/bootstrap files to read;
+- constraints and non-goals;
+- Definition of Done;
+- verification commands or evidence expected;
+- requirement to report changed files, checks run, unresolved gaps, and blockers.
+
+Do not over-specify implementation when repository conventions should decide it. For resumed sessions, keep the next-step prompt short because prior context is already present.
+
+## Result semantics
+
+The process exit code is meaningful:
+
+| Code | Meaning |
+|---|---|
+| `0` | Worker succeeded and routed delivery/wake was confirmed when requested |
+| `2` | CLI or routing validation error; worker did not start |
+| `42` | Requested provider session/thread could not be resumed |
+| `70` | Runner crashed |
+| `75` | Worker succeeded, but final routed delivery/wake was not confirmed |
+| `124` | Timeout |
+| other | Selected worker child exit code is preserved |
+
+The short `--detach` launcher returning `0` means only that systemd accepted the durable service. The worker's terminal result remains the service log, output file, registry status, and routed completion/wake; never report task success from detach acceptance alone.
+
+Outputs retain unique `/tmp/cc-<timestamp>-<run-id>.txt` names unless `--output` is supplied. Provider sessions are tracked atomically with an `engine` field in the legacy-compatible `~/.openclaw/claude_sessions.json`; old entries without `engine` mean Claude. Corrupt registries are preserved with a `.corrupt-<timestamp>` suffix before recovery.
+
+On WhatsApp, success requires direct result delivery plus gateway acceptance of an asynchronous `sessions_send` wake (`timeoutSeconds: 0`). The wrapper does not block on the large target session's full reasoning turn. On Telegram, the runner wakes the exact session, extracts the supervisor response, and delivers it deterministically. HTTP 200 alone is not success; the nested gateway/tool payload must also report a non-error status.
+
+## Testing language
+
+When the user says "run the tests" for a target project, run that project's tests. Do not reinterpret an ordinary project request as a runner E2E test.
+
+When modifying or explicitly testing this skill itself, use both layers:
 
 ```bash
-nohup python3 {baseDir}/run-task.py \
-  --task "$(cat /tmp/cc-prompt.txt)" \
-  --project ~/projects/my-project \
-  --session "SESSION_KEY" \
-  --session-label "Research on Jackson Berler" \
-  > /tmp/cc-run.log 2>&1 &
+python3 -m unittest discover -s {baseDir}/tests -v
+python3 -m py_compile {baseDir}/run-task.py {baseDir}/session_registry.py
 ```
 
-### Listing Recent Sessions
+Then follow the ordered live gates in `references/testing-protocol.md`. Do not replace its launch path or infer a persistent regression from a single live failure.
 
-The agent can read the session registry to find recent sessions:
+## Operational references
 
-```python
-# Python code (for agent automation)
-from session_registry import list_recent_sessions, find_session_by_label
+Load these in order when needed:
 
-# List sessions from last 72 hours
-recent = list_recent_sessions(hours=72)
-for session in recent:
-    print(f"{session['session_id']}: {session['label']} ({session['status']})")
+1. `CURRENT-BEHAVIOR.md` for the current implementation contract.
+2. `INCIDENT-INDEX.md` when diagnosing a failure or changing routing/lifecycle code.
+3. `TECHNICAL-INSIGHTS.md` for durable engineering lessons.
+4. `WAKE-TROUBLESHOOTING.md` for symptom-driven commands.
+5. Deployment-local `history/` when present and detailed incident evidence is required.
 
-# Find session by label (fuzzy match)
-session = find_session_by_label("Jackson")
-if session:
-    print(f"Found: {session['session_id']}")
-```
-
-Or manually inspect the registry:
-
-```bash
-cat ~/.openclaw/claude_sessions.json
-```
-
-### When to Resume vs Start Fresh
-
-**Resume when:**
-- You need context from previous conversation
-- Building on previous research/analysis
-- Continuing interrupted work
-- Following up with clarifications or next steps
-
-**Start fresh when:**
-- Completely unrelated task
-- Previous session was exploratory/experimental
-- You want a clean slate
-- Previous session context might cause confusion
-
-### Resume Failure Handling
-
-If a session ID is invalid or expired:
-- Error message sent to channel with suggestion to start fresh
-- Process exits cleanly (no partial work)
-- Check stderr in `/tmp/cc-run.log` for details
-
-Common resume failures:
-- Session expired (Claude Code has retention limits)
-- Invalid session ID (typo, wrong format)
-- Session from different project/context
-
-### Example Workflow
-
-**Step 1: Initial research**
-```bash
-# Save prompt
-write /tmp/research-prompt.txt with "Research the codebase architecture for project X"
-
-# Launch task (Telegram thread-safe example)
-nohup python3 {baseDir}/run-task.py \
-  --task "$(cat /tmp/research-prompt.txt)" \
-  --project ~/projects/project-x \
-  --session "agent:main:main:thread:<THREAD_ID>" \
-  --session-label "Project X architecture research" \
-  > /tmp/cc-run.log 2>&1 &
-```
-
-**Step 2: Check result and find session ID**
-```bash
-# Session ID printed in stderr: "📝 Session registered: <id>"
-tail /tmp/cc-run.log
-
-# Or read from registry
-cat ~/.openclaw/claude_sessions.json | grep "Project X"
-```
-
-**Step 3: Follow-up implementation**
-```bash
-# Save follow-up prompt
-write /tmp/implement-prompt.txt with "Based on your research, implement the authentication module"
-
-# Resume session
-nohup python3 {baseDir}/run-task.py \
-  --task "$(cat /tmp/implement-prompt.txt)" \
-  --project ~/projects/project-x \
-  --session "SESSION_KEY" \
-  --resume <session-id-from-step-1> \
-  --session-label "Project X auth implementation" \
-  > /tmp/cc-run2.log 2>&1 &
-```
-
-## Wake Troubleshooting
-
-When the agent wake / continue chain fails (no agent summary, wrong thread, session not resolved,
-iterative loop stalls, etc.), see the dedicated guide:
-
-→ **[WAKE-TROUBLESHOOTING.md](WAKE-TROUBLESHOOTING.md)**
-
-Includes a **Quick Triage Checklist (60 seconds)** plus detailed items: agent not waking,
-double messages, wrong thread routing, UUID resolution failures, session-locked wake,
-`❌ Invalid routing`, Telegram HTTP 400 silent drops, mid-task update failures, stale/duplicate wake skips, and more.
-
-## Current Stable Behavior (2026-04-24)
-
-This is the version validated in live Telegram thread tests.
-
-- **Two execution modes only:** `standard` (no model flag, claude picks its default model) and `fast` (true Fast mode via native `--fast` when available, otherwise `fastMode:true` settings under OAuth/subscription auth).
-- **Billing guard:** every Claude Code child process is launched with `ANTHROPIC_API_KEY` stripped. The wrapper must not accidentally burn API credits.
-- **Mode in notifications:** launch and completion notifications always show `Mode: standard` or `Mode: fast`. The model name is appended on completion only when Claude reports it via the `init`/`result` stream-json event — the wrapper never claims a pinned model it didn't pass.
-- **Estimated cost in completion notifications:** standard stripped-env Claude Code task runs show `Est. cost: subscription`; Fast mode shows dollar estimates from `total_cost_usd` because it consumes paid extra usage.
-- Wake continuity: Telegram wake is delivered (`openclaw agent --deliver`) so continuation turns are visible in chat.
-- No silent launch policy: agent must post a visible decision turn before launching next iteration.
-- Deterministic wake guard: duplicate/stale wake dispatch is skipped by per-project state + `wake_id`/output dedupe.
-- Trace mode: `--trace-live` emits technical milestones (`RUN_TASK START/COMPLETE`, `WAKE`, `WAKE SKIP`) into the same thread.
-- Resume safety: `--resume` must use the Claude session id from `📝 Session registered: ...` in the run log.
-- Compact heartbeat now includes active subagents count as `sub:<N>` (example: `🟢 CC (3min) | sub:1 | 12K tok | 18 calls | 🔧 Bash`).
-- `output_tokens` is aggregated from all assistant stream messages (main agent + subagents).
-- `last_activity` / last tool signal is unified: whichever actor (main or subagent) emitted the latest tool event is shown.
-- Active subagents are tracked via Task/Agent lifecycle in stream-json (`tool_use id` add, matching `tool_result`/`task_notification` remove).
-
-## Files
-
-```
-skills/claude-code-task/
-├── SKILL.md                    # This file
-├── WAKE-TROUBLESHOOTING.md     # Wake/continue chain diagnostics
-├── run-task.py                 # Async runner with notifications
-├── session_registry.py         # Session metadata storage
-└── pids/                       # PID files for running tasks (auto-managed)
-```
+Update `CURRENT-BEHAVIOR.md` whenever behavior changes. For a production failure, add one compact row to `INCIDENT-INDEX.md`; deployments that retain private operational history may put detailed evidence in `history/incidents/`. Keep `CHANGELOG.md` concise and release-oriented.

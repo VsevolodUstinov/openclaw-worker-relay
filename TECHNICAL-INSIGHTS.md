@@ -1,133 +1,67 @@
-# TECHNICAL INSIGHTS — claude-code-task
+# Technical Insights
 
-## 0) 2026-04-24 Two-mode wrapper: standard + true Fast mode
+These are current engineering invariants, not a chronological log. See `INCIDENT-INDEX.md` for failures and `history/` for evidence.
 
-The wrapper now exposes only two execution modes:
+## Routing is identity, not string parsing
 
-- **standard** — claude is invoked with no model flag. The CLI picks its current default.
-- **fast** — wrapper requests true Claude Code Fast mode via subscription/OAuth auth.
+A channel-looking key is insufficient. Direct message delivery can succeed while the intended supervisor session does not exist. Resolve the exact session and its delivery context first; parsing is only for extracting a route from verified metadata or a known key format.
 
-Local finding on Claude Code 2.1.119:
-- `claude -p --fast ...` still returns `unknown option '--fast'`.
-- `ANTHROPIC_API_KEY=... claude -p --settings '{"fastMode":true}' --model claude-opus-4-6 ...` returns standard speed / fast not on.
-- `env -u ANTHROPIC_API_KEY claude -p --settings '{"fastMode":true}' --model claude-opus-4-6 ...` returns `speed: "fast"` and `fast_mode_state: "on"` after extra usage is enabled.
+Do not silently substitute another agent id. A worker must wake the exact live supervisor that launched it unless the caller explicitly chooses a different verified session.
 
-Therefore every wrapper path, not just fast mode, must remove `ANTHROPIC_API_KEY` from the child process environment so Claude Code uses the logged-in OAuth/subscription session. This is a hard billing invariant to prevent accidental API spend. Fast mode should prefer native `claude -p --fast` if a future CLI exposes it; otherwise use the working settings/model fallback.
+## Delivery is a transaction
 
-Earlier insight that remains valid:
-- `--effort low` is a different mechanism (deliberation budget on the current model). The wrapper does **not** map `--fast` onto `--effort low`.
+Worker completion, visible result delivery, and supervisor wake are separate outcomes. Report them separately and never reduce success to HTTP status alone. Gateway calls can return HTTP 200 while the tool payload says failure.
 
-## 1) 2026-04-22 memory_search reindex root cause + tail-hang lesson
-- A seemingly "hung" OpenClaw session after `read skill -> memory_search` was not model reasoning drift, but blocking local indexing triggered by `agents.defaults.memorySearch.extraPaths` containing `~/SharedWorkspace`.
-- In this environment that path was enormous (~15GB / 169K files), so every `memory_search` could trigger a long full reindex instead of a quick lookup.
-- The practical operator symptom was deceptive:
-  - assistant looked stuck right after `memory_search`,
-  - gateway stayed alive,
-  - but the tool call could sit for ~16-20 minutes while SharedWorkspace indexing churned.
-- Concrete evidence pattern that confirmed it:
-  - gateway log showed a `memory_search` call lasting ~16 minutes,
-  - `lsof` on the gateway process showed huge `.tmp-*` sqlite-related files open and growing,
-  - after removing SharedWorkspace from `extraPaths`, those SharedWorkspace file descriptors disappeared and only small workspace/memory files remained.
-- Durable fix in this environment:
-  - set `agents.defaults.memorySearch.extraPaths` to `[]` (or keep it strictly limited to small intentional memory corpora),
-  - do not point memory search at giant operational workspaces.
-- Cleanup lesson:
-  - interrupted indexing can strand large orphaned `.tmp-*` files and silently waste tens of GB,
-  - cleanup should be part of the incident runbook after fixing the config.
-- Separate but related wrapper lesson from the same incident:
-  - Claude Code itself may finish substantive work and emit a result, yet `claude -p` can remain alive in a tail-hang state,
-  - `run-task.py` currently detects this (`result_seen but process still alive after grace`) but in `observe` mode only warns instead of terminating,
-  - this can create a second false impression that "the investigation is still running" even after the root cause is already found.
+For large persistent sessions, `sessions_send` with its default nonzero timeout waits for the target agent turn and can outlive an HTTP client. Use `timeoutSeconds: 0` for an asynchronous handoff and require a parsed `accepted` or other non-error tool result. The direct result remains the human-visible completion guarantee; the accepted wake is the continuation guarantee.
 
-## 2) 2026-04-14 runtime compatibility lesson
-- `run-task.py` must not depend on ambient third-party Python packages for basic transport.
-- Real failure observed after runtime/OpenClaw update:
-  - wrapper started under Python 3.14,
-  - `requests` was no longer installed in that interpreter,
-  - process died on import before routing validation or Claude launch.
-- This is the wrong failure boundary for an orchestration script.
-- Better pattern:
-  - use stdlib transport (`urllib.request`) for essential HTTP paths,
-  - reserve third-party dependencies for optional features only.
-- Practical operator symptom:
-  - `--validate-only` fails instantly with `ModuleNotFoundError: No module named 'requests'`,
-  - nothing is wrong with routing itself,
-  - the wrapper never reaches the routing code.
-- Verification after fix:
-  - `--validate-only` passes again,
-  - full detached E2E launch reaches startup marker and continues normally.
+Dedupe must be claim/commit, not check/mark: atomically claim a wake, perform the slow action, commit only after visible delivery, and release the claim on failure. This keeps retries possible without concurrent duplicates.
 
-## 1) What caused "extra" wake/agent replies
-- Root cause was event overlap + manual mid-cycle interventions.
-- With `--deliver`, every wake turn becomes visible, so delayed/stale wakes are now observable.
-- Fix: dedupe dispatch by `wake_id` and output file in per-project state.
+## Process status is an API
 
-## 2) Why visibility and continuity both matter
-- If wake is hidden, user loses chain-of-thought of orchestration decisions.
-- If wake is visible but unstructured, chat gets noisy and confusing.
-- Current compromise:
-  - technical events via `[TRACE][TECH]...`
-  - semantic decision via `[TRACE][AGENT][WAKE_RECEIVED]` + decision turn.
+Scheduled callers depend on process exit codes even when humans mostly observe chat messages. Preserve the selected worker's child code, distinguish timeout and resume failure, and use a dedicated code for notification failure after successful work.
 
-## 3) No-silent-launch is critical
-- Without a mandatory visible decision turn, step2 can appear to start "magically".
-- Policy now requires:
-  1. visible interpretation/decision,
-  2. only then launch next iteration.
+Read stdout and stderr concurrently. Pipe capacity is finite; waiting to read stderr until a verbose child exits can deadlock the entire wrapper.
 
-## 4) Resume pitfalls (most frequent operator error)
-- `run_id` and `wake_id` are not resume ids.
-- `--resume` must use the Claude session id logged as:
-  `📝 Session registered: <session-id>`.
+A stream result is stronger evidence of task completion than a lingering child process. After a short grace period, a post-result tail hang may be terminated while preserving the emitted result.
 
-## 5) Known practical pattern
-- Keep run-task as deterministic transport/orchestrator.
-- Keep planning/decision in the main agent session.
-- Let Claude runs be short and explicit, one iteration at a time.
+Shell detachment is not process-manager detachment. OpenClaw may clean up descendants when a bash tool scope exits, so `nohup ... &` can disappear without a normal runner terminal path. The canonical runner must move durable work into a user service itself; agents must not reconstruct service-manager commands or keep an expensive tool turn open with `wait`.
 
-## 6) Recommended live-debug setup
-- Turn on reasoning stream in chat.
-- Launch with `--trace-live`.
-- Watch for strict sequence:
-  - `RUN_TASK START`
-  - Claude complete
-  - `WAKE`
-  - `WAKE_RECEIVED` + decision
-  - optional next launch
+## The runner does not own repository topology
 
-## 7) 2026-04-01 additions (legacy cleanup + completion-tail failure)
-- Removing legacy launch fields is not enough; all post-completion notify paths must be audited too.
-- Failure pattern observed in production:
-  - Claude run completed successfully,
-  - output file was written,
-  - then `run-task.py` crashed on a stale `args.completion_mode` reference,
-  - resulting in heartbeat stopping and apparent "Claude stalled" confusion even though Claude had already finished.
-- Practical lesson:
-  - launch-surface cleanup must be paired with tail-path cleanup (`normal completion`, `resume failure`, `crash notify`).
-- Operator symptom to recognize:
-  - heartbeats suddenly stop,
-  - completion output file already exists,
-  - log shows success line followed by Python exception in notification/wake path.
-- Verification that fixed it:
-  - smoke run completed end-to-end,
-  - wake delivered normally,
-  - no post-completion AttributeError remained.
-- Resume-specific lesson:
-  - `--resume` should not reuse a full, verbose orchestration prompt.
-  - prior Claude session history is already present, so adding another long control prompt can trigger `Prompt is too long` before useful work starts.
-  - resumed launches should use a compact continuation instruction instead of replaying the entire task framing.
+Creating a project directory is a convenience; creating `.git` changes ownership and backup semantics. The wrapper must never initialize or nest repositories. Repository setup belongs to the caller or project bootstrap.
 
-## 8) 2026-03-03 additions (operator behavior + routing reliability)
-- E2E intent must be explicit in SKILL docs:
-  - "run tests" for this skill means operator E2E flow (routing→launch→heartbeat→completion), not `pytest`/`unittest` discovery.
-- Async boundary must be explicit:
-  - after detached `nohup` launch, agent should acknowledge and stop turn; continuation should happen on wake.
-  - same-turn waiting causes false negatives (agent "didn't see" completion until later wake).
-- Session key format reality:
-  - thread keys may appear as `agent:main:main:thread:<sender_id>:<thread_id>`.
-  - parsing must tolerate composite form and use last segment as thread/topic id.
-- Wake delivery is flaky under tight timeout budget:
-  - 40s was too short in practice; increased timeout and one retry reduced transient wake failures.
-- Practical testing insight:
-  - >4500-char prompt requirement can be used for useful creative output while still validating Telegram quote truncation/collapse behavior.
+## Subscription auth is explicit and provider-specific
 
+The server may contain API credentials for unrelated tooling. Worker tasks intentionally use logged-in subscriptions: strip `ANTHROPIC_API_KEY` from every Claude child path and strip `OPENAI_API_KEY`, `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`, and inherited `CODEX_HOME` from Codex. `CODEX_HOME` matters only inside some real parent agents, which is why an SSH-only smoke can pass while the routed worker fails. Codex must fall back to the user's saved `~/.codex` ChatGPT login. Detached Node CLIs also need the resolved CLI's directory in `PATH`, because an absolute `/usr/bin/env node` shim alone is insufficient.
+
+Semantic modes are provider-specific but the opt-in contract is shared. Default runs pin stable everyday choices, Terra for Codex and the forward-compatible Sonnet alias for Claude. Sol and Fable require explicit `--mode` selections, validate against their owning engine, and never arise from fallback or inference. Fast is a separate provider product mode, not an alias for low reasoning effort.
+
+## One lifecycle, narrow provider adapters
+
+Routing, launch notices, progress helpers, heartbeat, timeout/stall handling, result delivery, supervisor wake, output persistence, and exit semantics must remain shared. Provider branches belong only at the boundaries: auth environment, binary discovery, command construction, stream parsing, final-text extraction, and resume-error recognition. A second runner would inevitably drift in the failure paths that matter most.
+
+Session identity is namespaced by the recorded `engine`, even though the legacy registry filename is retained for compatibility. Reject a known cross-engine id before launch; never ask one provider to interpret the other's session id.
+
+Provider fallback is a failure classifier, not `primary || secondary`. Retry only when the primary is unavailable before useful work, and suppress its terminal wake so the secondary remains the single acceptance path. A timeout, tool call, completed result, or ordinary task failure may already have side effects and must never trigger an automatic second agent. Keep fallback fresh-only because provider session ids and explicit model names are not portable across engines.
+
+Defaults must be useful without being surprising. The no-flag runner path is Codex/Terra only; selecting Claude, Sol, Fable, a custom model, Fast, or any provider fallback requires an explicit flag. Explicit Claude without a mode means Sonnet. Production automations may deliberately choose explicit Codex-to-Claude fallback, but that policy belongs to each caller rather than the global default.
+
+## Live E2E evidence needs isolation
+
+Provider CLIs share mutable login, rollout, and local registry state. Parallel model/auth/resume probes can fail together and make independent features look broken. A live failure becomes durable current truth only after all earlier processes have exited, a standard control has established the baseline, and the same case has failed again sequentially with matching persisted-state evidence.
+
+The canonical runner is part of the behavior under test. Replacing its documented detached launch with `systemd-run`, raw CLI calls, or handwritten orchestration changes the experiment. Raw probes are useful only after canonical reproduction and must be reported as diagnostics, not substituted for the E2E result.
+
+## State files need filesystem semantics
+
+JSON read-modify-write is unsafe under cron and overlapping tasks. Use a lock around the transaction and atomic replace for persistence. Preserve corrupt input as evidence before recovery instead of silently deleting the only clue.
+
+## Instructions should follow loading priority
+
+Agents need the current contract and incident recognition patterns after compaction. They do not need every old release narrative in the forced context. Keep:
+
+- `SKILL.md`: decisions and operating workflow;
+- `CURRENT-BEHAVIOR.md`: exact current contract;
+- `INCIDENT-INDEX.md`: compact failure memory;
+- `TECHNICAL-INSIGHTS.md`: durable principles;
+- `history/`: detailed evidence loaded only during diagnosis.
