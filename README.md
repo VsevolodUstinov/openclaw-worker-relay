@@ -7,8 +7,10 @@ Worker Relay is deliberately distinct from two adjacent surfaces:
 | Surface | Meaning |
 |---|---|
 | Native OpenClaw subagent | An agent created and managed inside OpenClaw |
-| Direct CLI session | A human runs `codex` or `claude` interactively |
+| Direct CLI session | An explicit request to bypass Worker Relay and run `codex` or `claude` interactively |
 | Worker Relay | OpenClaw supervises an external CLI worker through the complete async harness |
+
+Any request to call, run, invoke, use, ask, or delegate to Claude or Codex selects Worker Relay, even for a small task. Native subagents and raw CLI are never inferred as substitutes.
 
 ## What it provides
 

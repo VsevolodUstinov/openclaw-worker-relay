@@ -16,6 +16,9 @@ class InstructionContractTests(unittest.TestCase):
             "native OpenClaw subagent",
             "raw interactive CLI invocation",
             "historical name `claude-code-task`",
+            "Any explicit request to call, run, invoke, use, ask, or delegate",
+            "even when the underlying task is small",
+            "Direct CLI is allowed only when the user explicitly asks to bypass Worker Relay",
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, skill)

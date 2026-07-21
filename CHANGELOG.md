@@ -11,6 +11,7 @@
 - Added side-effect-aware provider fallback only for unavailability before useful work.
 - Added 52 deterministic tests and an ordered real-context E2E protocol.
 - Retired the divergent `run-task.sh`, standalone notification helper, Claude-only instructions, and handwritten `nohup` launch flow.
+- Made every explicit request to invoke Claude/Codex trigger Worker Relay regardless of task size; raw CLI now requires an explicit bypass request.
 
 ## Earlier releases
 

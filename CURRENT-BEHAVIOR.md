@@ -8,6 +8,7 @@ Last synchronized with the canonical Worker Relay implementation on 2026-07-20.
 - Entrypoint: `run-task.py`
 - OpenClaw is the supervisor; Codex and Claude Code are external workers.
 - Native OpenClaw subagents and direct interactive CLI sessions are separate surfaces.
+- Any explicit request to call or ask Claude/Codex uses Worker Relay regardless of task size. Direct CLI requires an explicit request to bypass Worker Relay.
 - The old `claude-code-task` name is retired; new callers use Worker Relay.
 
 ## Execution

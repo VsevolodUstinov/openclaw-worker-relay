@@ -1,6 +1,6 @@
 ---
 name: worker-relay
-description: "Run Codex CLI, Claude Code, or another supported external agent as a supervised asynchronous worker with strict OpenClaw routing, progress notifications, result delivery, session resume, optional provider fallback, and multi-turn supervisor ownership. Use when asked to delegate substantial coding, research, analysis, document generation, or automation work to Codex/Claude, run a background worker with chat updates, continue an external worker session, or notify the originating chat when done. Do not use for native OpenClaw subagents, direct interactive CLI sessions, or quick conversational answers."
+description: "Run Codex CLI, Claude Code, or another supported external agent as a supervised asynchronous worker with strict OpenClaw routing, progress notifications, result delivery, session resume, optional provider fallback, and multi-turn supervisor ownership. Always use whenever the user asks to call, run, invoke, use, ask, or delegate to Codex or Claude, even for a small task; also use for substantial background work, automations, worker-session continuation, and chat notification on completion. Never substitute a native OpenClaw subagent or raw CLI. Direct interactive CLI is allowed only when the user explicitly asks to bypass Worker Relay and run it directly."
 ---
 
 # Worker Relay
@@ -8,6 +8,10 @@ description: "Run Codex CLI, Claude Code, or another supported external agent as
 Worker Relay is OpenClaw's external-agent execution harness. It runs Claude Code or Codex CLI as an asynchronous worker while the current OpenClaw agent remains the supervisor and delivery owner. The canonical executable is `{baseDir}/run-task.py`; do not create another runner or copy it into an automation. The historical name `claude-code-task` may remain in upgraded deployments only as a compatibility alias, never as a second implementation.
 
 Use these terms consistently: OpenClaw is the **supervisor**, Claude Code/Codex are **external workers**, and Worker Relay is the harness connecting dispatch, progress, delivery, wake, and continuation. A native OpenClaw subagent and a raw interactive CLI invocation are different execution surfaces.
+
+## Trigger precedence
+
+Any explicit request to call, run, invoke, use, ask, or delegate to Claude Code or Codex triggers Worker Relay, even when the underlying task is small or could be answered inline. Do not replace that request with a native OpenClaw subagent or raw CLI. Direct CLI is allowed only when the user explicitly asks to bypass Worker Relay and run the provider interactively.
 
 ## Non-negotiable operating rules
 
