@@ -6,6 +6,7 @@
 - Clarified that `run-task.py` is invoked through `python3` and does not require an executable bit.
 - Added first-read contract regressions for both rules; the deterministic suite now covers 53 cases.
 - Made the selected external provider own the delegated result; validation-only supervisors no longer answer the unlaunched task inline.
+- Passed `3/3` consecutive independent production-shaped Iris contexts, including explicit Claude and adversarial native-subagent wording, with zero failed tool calls.
 
 ## 2.0.0 - 2026-07-20
 
