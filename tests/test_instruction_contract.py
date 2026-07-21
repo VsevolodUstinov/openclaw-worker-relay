@@ -19,6 +19,8 @@ class InstructionContractTests(unittest.TestCase):
             "Any explicit request to call, run, invoke, use, ask, or delegate",
             "even when the underlying task is small",
             "Direct CLI is allowed only when the user explicitly asks to bypass Worker Relay",
+            "do not solve the delegated task inline as a substitute or supplement",
+            "stop after routing validation and do not state or infer the answer",
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, skill)

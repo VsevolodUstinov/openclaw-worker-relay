@@ -13,6 +13,8 @@ Use these terms consistently: OpenClaw is the **supervisor**, Claude Code/Codex 
 
 Any explicit request to call, run, invoke, use, ask, or delegate to Claude Code or Codex triggers Worker Relay, even when the underlying task is small or could be answered inline. Do not replace that request with a native OpenClaw subagent or raw CLI. Direct CLI is allowed only when the user explicitly asks to bypass Worker Relay and run the provider interactively.
 
+Once triggered, do not solve the delegated task inline as a substitute or supplement. The requested provider owns the task result and OpenClaw supervises it. If the user explicitly limits a check to `--validate-only`, stop after routing validation and do not state or infer the answer to the unlaunched worker task.
+
 Provider and fallback selection are literal. A request for Codex means Codex only; a request for Claude means Claude only. Do not add `--fallback-engine` because fallback exists, because an automation uses it, or because the user asks what fallback was selected. Fallback is `none` unless the user or owning automation explicitly requests cross-provider continuity.
 
 ## Non-negotiable operating rules

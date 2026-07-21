@@ -5,6 +5,7 @@
 - Removed fallback from default validation and launch examples; explicit Claude/Codex requests now remain single-provider unless cross-provider continuity is explicitly requested.
 - Clarified that `run-task.py` is invoked through `python3` and does not require an executable bit.
 - Added first-read contract regressions for both rules; the deterministic suite now covers 53 cases.
+- Made the selected external provider own the delegated result; validation-only supervisors no longer answer the unlaunched task inline.
 
 ## 2.0.0 - 2026-07-20
 
